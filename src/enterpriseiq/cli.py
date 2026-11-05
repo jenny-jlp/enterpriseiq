@@ -34,6 +34,8 @@ def main():
     resume = sub.add_parser("resume", help="Continue an existing investigation from PostgreSQL")
     resume.add_argument("run_id", type=UUID)
     resume.add_argument("--pause-after-tool", action="store_true")
+    verify = sub.add_parser("verify-run", help="Independently validate a saved run without model calls")
+    verify.add_argument("path", type=Path)
     args = parser.parse_args()
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -47,6 +49,16 @@ def main():
                 result = {"snapshot_id": SNAPSHOT_ID, **summary(conn)}
             elif args.command == "tool":
                 result = BusinessTools(conn).execute(args.name, json.loads(args.arguments))
+            elif args.command == "verify-run":
+                from enterpriseiq.reliability import ReportVerifier
+
+                state = json.loads(args.path.read_text(encoding="utf-8"))
+                state["answer"] = state.get("draft_answer", state.get("answer", ""))
+                result = {"run_id": state["run_id"], **ReportVerifier(conn).verify(state)}
+                path = Path("outputs") / f"{UUID(state['run_id'])}.validation.json"
+                path.parent.mkdir(exist_ok=True)
+                path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                result["output_path"] = str(path.resolve())
             elif args.command in ("investigate", "resume"):
                 from enterpriseiq.agent import build_agent, execute_run, initial_state, postgres_checkpointer, result_summary, save_result
 

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.errors import GraphInterrupt
 from langsmith import tracing_context
 import psycopg
 from psycopg.rows import dict_row
@@ -18,8 +19,9 @@ from psycopg.rows import dict_row
 from enterpriseiq.dataset import SNAPSHOT_ID
 from enterpriseiq.model import ModelError
 from enterpriseiq.tools import tool_definitions
+from enterpriseiq.reliability import ReportVerifier, report_instructions, semantic_scope
 
-ENGINE_VERSION = "m1-alpha-1"
+ENGINE_VERSION = "m1-alpha-2"
 SYSTEM_PROMPT = """You are EnterpriseIQ's business investigation agent. Answer the user's question in Chinese.
 Choose your own investigation path using ONLY the supplied read-only business tools. No task-specific workflow is provided.
 Start by briefly stating the investigation goal and the next evidence needed. After seeing results, choose the next useful tool or finish.
@@ -64,6 +66,12 @@ class InvestigationState(TypedDict):
     status: str
     stop_reason: str
     answer: str
+    draft_answer: str
+    report: dict
+    report_validation: str
+    report_repair_count: int
+    report_attempts: Annotated[list[dict], operator.add]
+    needs_report_repair: bool
 
 
 def initial_state(question, model_name, *, max_tool_calls=20, max_seconds=180):
@@ -74,7 +82,9 @@ def initial_state(question, model_name, *, max_tool_calls=20, max_seconds=180):
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question}],
                 evidence={}, trace={}, errors=[], pending_calls=[], model_calls=0, tool_calls=0,
                 prompt_tokens=0, completion_tokens=0, max_tool_calls=max_tool_calls, max_model_calls=20,
-                deadline=time.time()+max_seconds, status="running", stop_reason="", answer="")
+                deadline=time.time()+max_seconds, status="running", stop_reason="", answer="",
+                draft_answer="", report={}, report_validation="pending", report_repair_count=0,
+                report_attempts=[], needs_report_repair=False)
 
 
 def collect_evidence(value):
@@ -95,8 +105,13 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_agent(model, tools, checkpointer, *, pause_after_tool=False):
+def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=None):
+    verifier = verifier or (ReportVerifier(tools.conn) if hasattr(tools, "conn") else None)
+
     def think(state):
+        scope = semantic_scope(state["question"])
+        if scope in ("clarification_required", "unsupported_geographic_arr"):
+            return {"stop_reason": scope}
         if time.time() >= state["deadline"]:
             return {"stop_reason": "time_budget"}
         if state["model_calls"] >= state["max_model_calls"]:
@@ -105,7 +120,8 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False):
         start = time.perf_counter()
         try:
             budget = {"role": "system", "content": f"Remaining budget: {state['max_tool_calls']-state['tool_calls']} tool calls, "
-                      f"{state['max_model_calls']-state['model_calls']} model calls. If remaining evidence is sufficient, answer now; otherwise query only the missing facts."}
+                      f"{state['max_model_calls']-state['model_calls']} model calls. If remaining evidence is sufficient, answer now; otherwise query only the missing facts.\n"
+                      + report_instructions() + f"\nExpected report scope: {scope}."}
             reply = model.complete([*state["messages"], budget], tool_definitions(), timeout=max(0.01, min(60, state["deadline"]-time.time())))
         except ModelError as exc:
             return {"model_calls": number, "stop_reason": exc.code,
@@ -116,6 +132,8 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False):
         reason = "answered" if finished and reply.finish_reason == "stop" and reply.message["content"].strip() else ""
         if finished and not reason:
             reason = "incomplete_model_response"
+        if time.time() >= state["deadline"]:
+            reason = "time_budget"
         return {"messages": [reply.message], "pending_calls": calls, "model_calls": number,
                 "prompt_tokens": state["prompt_tokens"]+reply.usage.get("prompt_tokens", 0),
                 "completion_tokens": state["completion_tokens"]+reply.usage.get("completion_tokens", 0),
@@ -138,7 +156,16 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False):
         except (TypeError, ValueError):
             arguments = None  # BusinessTools returns a schema validation error.
         start = time.perf_counter()
-        result = tools.execute(name, arguments)
+        try:
+            if hasattr(tools, "timeout_ms"):
+                tools.timeout_ms = max(1, min(10000, int((state["deadline"]-time.time())*1000)))
+            result = tools.execute(name, arguments)
+        except GraphInterrupt:
+            raise
+        except Exception:
+            result = {"status": "error", "complete": False,
+                      "error": {"code": "tool_execution_error", "message": "Tool execution failed", "retryable": False}}
+        result["call_id"] = call["id"]
         number = state["tool_calls"] + 1
         refs = collect_evidence(result)
         event = {"type": "tool", "number": number, "at": timestamp(), "call_id": call["id"],
@@ -160,9 +187,42 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False):
         return "tools" if state["pending_calls"] else "agent"
 
     def finish(state):
-        success = state["stop_reason"] == "answered" and state["tool_calls"] > 0 and not state["errors"]
-        status = "completed" if success else "partial" if state["evidence"] else "failed"
-        return {"status": status, "answer": state["answer"] or "调查未完成；请根据 stop_reason、errors 和已有证据复查缺口。"}
+        try:
+            verified = verifier.verify(state) if verifier else None
+        except (ValueError, KeyError, TypeError, psycopg.Error):
+            verified = None
+        if verified is None:
+            verified = {"status": "partial" if state["evidence"] else "failed", "report_validation": "blocked",
+                        "report": {"formal_report": None, "verified_claims": [], "gaps": [{"code": "verification_failed"}], "conflicts": [], "rejected_claims": []}}
+        report = verified["report"]
+        expired = time.time() >= state["deadline"]
+        if expired and verified["report_validation"] == "passed":
+            report["formal_report"] = None
+            report["gaps"].append({"code": "time_budget"})
+            verified["status"], verified["report_validation"] = "partial", "blocked"
+        repairable = (verified["report_validation"] == "blocked" and state["stop_reason"] == "answered"
+                      and not state["errors"] and not report.get("conflicts")
+                      and state.get("report_repair_count", 0) < 1
+                      and state["model_calls"] < state["max_model_calls"] and time.time() < state["deadline"])
+        attempt = {"draft": state["answer"], "validation": verified}
+        if repairable:
+            feedback = {"role": "system", "content": "Independent report validation rejected this draft. You have ONE correction opportunity within the original budget. "
+                        "Use only original evidence, fix unsupported fields/claims, or fetch missing pages. Do not discard conflicting evidence or change the requested scope. "
+                        "Return a corrected typed report. Validation findings: " + json.dumps(report["gaps"], ensure_ascii=False)}
+            return {**verified, "draft_answer": state["answer"], "messages": [feedback], "answer": "",
+                    "stop_reason": "", "report_repair_count": state.get("report_repair_count", 0)+1,
+                    "report_attempts": [attempt], "needs_report_repair": True}
+        if report["formal_report"] is not None:
+            answer = report["formal_report"]
+        elif state["stop_reason"] == "clarification_required":
+            answer = "需要澄清：这里的区域指直接产品组件，还是客户地理区域？未生成正式金额报告。"
+        elif state["stop_reason"] == "unsupported_geographic_arr":
+            answer = "当前金额工具不支持按客户地理区域聚合 ARR，未生成正式金额报告。"
+        else:
+            answer = "未通过正式报告校验；仅保留部分结果与原始证据。缺口：" + ", ".join(gap["code"] for gap in report["gaps"])
+        return {**verified, "draft_answer": state["answer"], "answer": answer,
+                "stop_reason": "time_budget" if expired else state["stop_reason"],
+                "report_attempts": [attempt], "needs_report_repair": False}
 
     builder = StateGraph(InvestigationState)
     builder.add_node("agent", think)
@@ -171,7 +231,7 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False):
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", after_model, {"tools": "tools", "finish": "finish"})
     builder.add_conditional_edges("tools", after_tool, {"tools": "tools", "agent": "agent", "finish": "finish"})
-    builder.add_edge("finish", END)
+    builder.add_conditional_edges("finish", lambda state: "agent" if state.get("needs_report_repair") else "end", {"agent": "agent", "end": END})
     return builder.compile(checkpointer=checkpointer, interrupt_after=["tools"] if pause_after_tool else None)
 
 
@@ -218,7 +278,6 @@ def execute_run(graph, *, state=None, run_id=None):
     result["status"] = "paused" if snapshot.next else result["status"]
     result["next_nodes"] = list(snapshot.next)
     result["checkpoint_id"] = snapshot.config["configurable"]["checkpoint_id"]
-    result["report_validation"] = "pending_delivery_4"
     return result
 
 
@@ -233,5 +292,7 @@ def save_result(result):
 def result_summary(result):
     return {key: result[key] for key in ("run_id", "status", "snapshot_id", "checkpoint_id", "next_nodes",
             "model_calls", "tool_calls", "prompt_tokens", "completion_tokens", "stop_reason", "report_validation", "answer")} | {
+                "report": {key: value for key, value in result.get("report", {}).items() if key != "verified_claims"} | {
+                    "verified_claims": [{key: item[key] for key in ("index", "statement")} for item in result.get("report", {}).get("verified_claims", [])]},
                 "tool_trace": [{key: event[key] for key in ("number", "name", "arguments", "status", "complete")}
                                for event in result["trace"].values() if event["type"] == "tool"]}

@@ -41,6 +41,13 @@ class AdaptiveModel:
         return Completion(message, {"prompt_tokens": 5, "completion_tokens": 2}, self.name, "test-response", "tool_calls" if "tool_calls" in message else "stop")
 
 
+class FixtureVerifier:
+    """Loop/recovery fixture only; source verification has separate real-DB tests."""
+    def verify(self, state):
+        return {"status": "completed", "report_validation": "passed", "report": {
+            "formal_report": "Account found", "gaps": [], "verified_claims": [], "conflicts": []}}
+
+
 def test_agent_tool_budget_routes_to_partial_without_extra_call():
     tools = EvidenceTools()
     graph = build_agent(AdaptiveModel(), tools, InMemorySaver())
@@ -80,7 +87,7 @@ def test_postgres_checkpoint_survives_connection_and_graph_recreation():
     state = initial_state("Find account", "test-model")
     first_tools = EvidenceTools()
     with postgres_checkpointer(dsn) as saver:
-        graph = build_agent(AdaptiveModel(), first_tools, saver, pause_after_tool=True)
+        graph = build_agent(AdaptiveModel(), first_tools, saver, pause_after_tool=True, verifier=FixtureVerifier())
         paused = execute_run(graph, state=state)
         assert paused["status"] == "paused" and paused["next_nodes"] == ["agent"]
         assert paused["tool_calls"] == 1 and paused["model_calls"] == 1
@@ -88,7 +95,7 @@ def test_postgres_checkpoint_survives_connection_and_graph_recreation():
     second_tools = EvidenceTools()
     with postgres_checkpointer(dsn) as saver:
         try:
-            graph = build_agent(AdaptiveModel(), second_tools, saver)
+            graph = build_agent(AdaptiveModel(), second_tools, saver, verifier=FixtureVerifier())
             restored = execute_run(graph, run_id=state["run_id"])
             assert restored["status"] == "completed"
             assert first_tools.calls == ["search_accounts"] and second_tools.calls == ["get_record"]

@@ -1,6 +1,6 @@
 # EnterpriseIQ · Investigation Engine Alpha
 
-当前开发 M1；M0 产品与架构基线见 `docs/`。已提供快照导入、8 个业务工具及 DeepSeek 驱动的 LangGraph 调查 Agent。报告是待独立验证的草稿。
+当前开发 M1；M0 产品与架构基线见 `docs/`。已提供快照导入、8 个业务工具、DeepSeek 驱动的 LangGraph 调查 Agent，以及基于原始来源的结构化报告校验。
 
 ## 本地运行（PowerShell）
 
@@ -44,7 +44,24 @@ Checkpoint 使用独立的 `investigation_checkpoint` schema、独立 autocommit
 
 默认每次调查最多 20 次工具调用、20 次模型调用、180 秒；`--max-tool-calls` 和 `--max-seconds` 可在启动时设置。恢复保留已有预算与绝对截止时间，人工暂停时间也计入；此版本不支持长暂停延期。预算耗尽输出 partial/failed 与已有证据，不标记为完整调查。API 失败暂不自动重试；有限错误修正由模型通过工具结果自行决定。
 
-本地 `outputs/<run_id>.json` 保存完整工具消息与 Trace；终端输出摘要。LangSmith 外部 tracing 显式禁用。运行状态 completed 仅表示图执行结束，`report_validation=pending_delivery_4` 明确表示结论尚未独立校验。引用 ID 存在不等于主张被证据支持，歧义问题仍可能导致错误口径，属于后续报告校验范围。
+本地 `outputs/<run_id>.json` 保存工具消息、Trace、原始草稿及每次校验结果；终端输出摘要。LangSmith 外部 tracing 显式禁用。
+
+## 证据与基本可靠性
+
+正式报告只由通过校验的结构化主张渲染：原始字段值、逐字摘录、共享组件候选、明确文本引用、确定性 ARR 和显式 ETA 来源观测。不把模型自由文本转述自动认证为事实。引用必须来自本次成功工具返回，且能回查原始文件哈希、JSON 位置或已读取的正文行；数据库记录与原始来源不一致时拒绝发布。
+
+ARR 另从原始账户/工单 JSON 用 Decimal 独立复算，检查筛选优先级、客户集合、去重、分组、前三名及币种。含糊的“按区域统计 ARR”要求澄清；明确的地理 ARR 聚合返回不支持，不用组件计算替代。当前确定性金额工具只支持直接产品组件和全局去重。
+
+查询完整性按规范化参数累计各页记录 ID 和连续覆盖区间；只读第一页或最后一页、缺中间页、总数变化、正文未读完、工具请求未执行或失败，均会形成明确缺口。即使已验证部分主张也返回 partial，`formal_report=null`。无可用证据时返回 failed；只有主张、口径、查询覆盖、执行预算均通过时才返回 completed / report_validation=passed。
+
+已观察证据中的显式 ETA 日期/未承诺状态会自动按 issue 归属检测冲突，冲突不会由模型自行挑选一方解决。当前不提供通用自然语言蕴含裁判，也不自动解决合同适用性、跨时间文本矛盾等复杂判断；原文观察与未验证问题分开保留。模型可在原预算内最多修正一次格式/字段/证据缺口，失败草稿和校验反馈全部保留；这不是无限重试。
+
+```powershell
+# 不调用模型，独立复核已保存运行；旧版自由文本草稿会被阻止直接升级为正式报告。
+uv run --env-file .env enterpriseiq verify-run outputs/<run_id>.json
+```
+
+报告契约变化后引擎版本为 `m1-alpha-2`；新运行的暂停/恢复已验证。旧版 `m1-alpha-1` checkpoint 不跨版本续跑，以免把旧自由文本当作正式结果；原文件仍可用 verify-run 审核，不会覆盖原始运行记录。
 
 ## 验证
 

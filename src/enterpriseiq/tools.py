@@ -91,6 +91,7 @@ def evidence_id(snapshot_id, kind, source_id, location):
 class BusinessTools:
     def __init__(self, conn, snapshot_id=SNAPSHOT_ID):
         self.conn, self.snapshot_id = conn, snapshot_id
+        self.timeout_ms = 10000
 
     def _rows(self, query, params=()):
         with self.conn.cursor(row_factory=dict_row) as cur:
@@ -123,7 +124,7 @@ class BusinessTools:
             return self._error("invalid_arguments", "Arguments do not match the tool schema")
         try:
             with self.conn.transaction():
-                self.conn.execute("SET LOCAL statement_timeout='10s'")
+                self.conn.execute("SELECT set_config('statement_timeout',%s,true)", (str(self.timeout_ms),))
                 if not self._rows("SELECT 1 FROM enterpriseiq.snapshots WHERE snapshot_id=%s", (self.snapshot_id,)):
                     return self._error("snapshot_not_found", "Requested snapshot has not been imported")
                 data = getattr(self, "_" + name)(args)
