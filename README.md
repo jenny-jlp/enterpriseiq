@@ -1,6 +1,6 @@
 # EnterpriseIQ · Investigation Engine Alpha
 
-当前开发 M1；M0 产品与架构基线见 `docs/`。目前提供固定快照导入、跨系统关联检查及 8 个受约束业务工具，尚无 Agent 调查运行结果。
+当前开发 M1；M0 产品与架构基线见 `docs/`。已提供快照导入、8 个业务工具及 DeepSeek 驱动的 LangGraph 调查 Agent。报告是待独立验证的草稿。
 
 ## 本地运行（PowerShell）
 
@@ -26,7 +26,25 @@ uv run --env-file .env enterpriseiq tool list_open_tickets --arguments '{"accoun
 
 金额使用 PostgreSQL numeric 和 Python Decimal，输出十进制字符串。每个直接组件按客户去重，全局再独立去重，不累加区域总额。未提供账户币种时标记 `UNSPECIFIED_BENCHMARK`；ARR 与机会 ACV 不合并；缺少 ARR 时不输出部分总额冒充完整结果。
 
-模型供应方已确定为 DeepSeek；在本地 `.env` 配置 `DEEPSEEK_API_KEY`，默认模型 `deepseek-flash`、Base URL `https://api.deepseek.com`。密钥不得写进命令行或 Git。当前仅完成最小 API 连通验证；动态调查路径和 checkpoint 恢复将在后续交付中验证。
+模型供应方为 DeepSeek；在本地 `.env` 配置 `DEEPSEEK_API_KEY`，默认模型 `deepseek-flash`、Base URL `https://api.deepseek.com`。密钥不得写进命令行或 Git。
+
+## 调查 Agent
+
+```powershell
+uv run --env-file .env enterpriseiq investigate 'Vantara 的扩展交易被什么阻塞，是否有承诺 ETA？请查阅原始证据。'
+uv run --env-file .env enterpriseiq investigate '开放 p0/p1 工单按直接产品组件的去重 ARR 前三名是什么？'
+# 最小恢复验证：首个工具执行完后持久化并退出；用上条输出的 run_id 开启新进程继续。
+uv run --env-file .env enterpriseiq investigate '调查 Vantara 的交易阻塞与下一步行动' --pause-after-tool
+uv run --env-file .env enterpriseiq resume <run_id>
+```
+
+两个问题走同一个 `StateGraph`：`agent → tools → agent` 循环，每次只执行模型实际请求的一个工具；批量工具请求会逐项执行、逐项 checkpoint。条件路由依据待执行工具、回答、错误与预算，不按问题关键词选择预设流程。使用 DeepSeek 原生 function calling；图状态保存工具消息、证据字典、Trace、错误与累计用量，不保存隐藏思维链。汇总结果附展示名称以减少无意义重复读取。
+
+Checkpoint 使用独立的 `investigation_checkpoint` schema、独立 autocommit 连接和 `durability="sync"`；`resume` 从同一 run 的未完成节点继续，已结束的 run 不重新调用模型。初始化锁只保护 schema/migration，不提供后台调度。只读工具在节点中途崩溃时可能重读；不承诺副作用恰好一次或并发恢复安全。
+
+默认每次调查最多 20 次工具调用、20 次模型调用、180 秒；`--max-tool-calls` 和 `--max-seconds` 可在启动时设置。恢复保留已有预算与绝对截止时间，人工暂停时间也计入；此版本不支持长暂停延期。预算耗尽输出 partial/failed 与已有证据，不标记为完整调查。API 失败暂不自动重试；有限错误修正由模型通过工具结果自行决定。
+
+本地 `outputs/<run_id>.json` 保存完整工具消息与 Trace；终端输出摘要。LangSmith 外部 tracing 显式禁用。运行状态 completed 仅表示图执行结束，`report_validation=pending_delivery_4` 明确表示结论尚未独立校验。引用 ID 存在不等于主张被证据支持，歧义问题仍可能导致错误口径，属于后续报告校验范围。
 
 ## 验证
 
@@ -36,4 +54,4 @@ uv run pytest tests/test_dataset.py
 uv run --env-file .env pytest
 ```
 
-集成测试逐项回滚，不修改开发数据库；未配置独立测试库或未提供数据包时会明确跳过。测试覆盖数据导入与关联、独立原始数据计算基线、分页、金额精度、缺失 ARR、非法输入、查询注入、文档行引用、幂等和事务回滚。
+业务集成测试逐项回滚，不修改开发数据库；未配置独立测试库或未提供数据包时会明确跳过。测试覆盖数据与业务工具，以及 Agent 预算路由、错误状态、PostgreSQL 重建连接恢复和已完成 run 的重复 resume。新增初始化竞争回归测试仅在专用 `enterpriseiq_test` 库重建 checkpoint schema，不作用于开发库。自动测试不调用付费模型；真实 DeepSeek 验证记录见 `docs/PROJECT_STATUS.md`。

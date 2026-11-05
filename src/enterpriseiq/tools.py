@@ -229,6 +229,14 @@ class BusinessTools:
                              "(r.entity_type='ticket' AND r.source_id=ANY(%s)) OR "
                              "(r.entity_type='part' AND r.source_id=ANY(%s))) ORDER BY r.entity_type,r.source_id",
                              (self.snapshot_id, sorted(global_accounts), sorted(global_tickets), sorted(by_part)))
+        names = {row["source_id"]: row["data"].get("account_name", row["data"].get("title"))
+                 for row in lineage if row["entity_type"] in ("account", "part")}
+        for group in groups:
+            group["part_name"] = names[group["part_id"]]
+            group["accounts"] = [{"account_id": key, "account_name": names[key],
+                                  "arr": str(by_part[group["part_id"]]["accounts"][key])
+                                         if by_part[group["part_id"]]["accounts"][key] is not None else None}
+                                 for key in group["account_ids"]]
         return {"groups": groups, "global": metric(global_accounts, global_tickets),
                 "currency": "UNSPECIFIED_BENCHMARK", "metric": "ARR", "grouping": "direct_component",
                 "deduplication": "account_id within each group and again globally; never sum group ARR",

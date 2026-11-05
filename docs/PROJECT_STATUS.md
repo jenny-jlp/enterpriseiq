@@ -3,10 +3,10 @@
 更新：2026-11-05（Asia/Shanghai）。
 
 - M0：已完成，五份既有文档保留为参考基线。
-- 当前：M1 — Investigation Engine Alpha；五项计划已获用户确认，交付项 1、2 已完成，Agent 调查引擎待实施。
+- 当前：M1 — Investigation Engine Alpha；交付项 1、2 已确认；交付项 3 已实现并完成真实模型与最小恢复验证，报告独立校验待交付项 4。
 - 分支：`codex/m1-investigation-engine-alpha`；基线提交：`edaee68`。
 - 初始仓库：仅 `.gitignore` 和五份 M0 文档；无应用代码、依赖配置或项目内数据包；初始工作区干净。
-- 已建立 Python/uv 工程、锁定依赖、Docker Compose PostgreSQL、本地配置示例与运行入口；未提交 Git 变更。
+- 交付项 1、2 经用户明确授权已创建阶段性 Commit `91cbc8a`（feat: import audited snapshot and add typed business tools），未合并 main；后续实现尚未提交。
 
 ## M1 交付项
 
@@ -14,7 +14,7 @@
 |---|---|---|
 | 版本化快照导入与跨系统关联 | 已完成 | 已通过全量导入、来源解析、关键外键、Vantara 链、幂等与事务回滚验证 |
 | 受约束业务工具与精确计算 | 已完成 | 结构化关联与 ARR 均符合独立原始数据基线；分页、金额口径、输入约束和来源引用已验证；不代表 Agent 任务已通过 |
-| 可运行 LangGraph Investigation Agent | 待实施 | 真实模型动态选择工具，状态记录计划摘要、证据、预算与错误；可持久化并在重启后继续 |
+| 可运行 LangGraph Investigation Agent | 已完成 | 已有两个问题的真实 DeepSeek tool calling Trace；StateGraph 条件路由、预算与 PostgreSQL 最小恢复已验证；报告仍是未独立校验草稿 |
 | 证据报告、基本验证与错误处理 | 待实施 | 重要引用可解析，数值可复核，未知 ETA/冲突不被编造；故障与预算耗尽有明确结果 |
 | Alpha 端到端验收与交付 | 待实施 | 三个既定样本各重复运行 3 次，报告成功/失败及调用量、用量、成本可得性与延迟；提供复现入口 |
 
@@ -41,7 +41,23 @@
 
 - 用户选择 DeepSeek，Flash 或 Pro 均可；默认采用官方 API 的 `deepseek-flash`，Base URL 为 `https://api.deepseek.com`，不使用 OpenAI 凭据。
 - 用户已在忽略的 `.env` 配置 DEEPSEEK_API_KEY；经用户授权的最小真实请求成功，返回 `OK`，prompt 9 / completion 1 / total 10 token，未发送业务数据。
-- API 连通不等于 Agent 已通过验收；尚未验证真实动态工具调用、报告质量与 checkpoint 恢复。价格未硬编码，账单成本尚未测得。
+- API 已用于真实动态工具调用和新进程 checkpoint 恢复；报告质量仍待独立验证。价格未硬编码，账单成本尚未测得。
+
+## 交付项 3 实证（2026-11-05）
+
+- 使用锁定版本 LangGraph 1.2.20、langgraph-checkpoint-postgres 3.2.0、httpx 0.28.1。统一 StateGraph 不按问题关键词路由：模型产生原生工具请求，工具执行器逐项执行，再由模型选择后续查询或完成。
+- State 包含消息、待执行工具、按 ID 合并的证据/Trace、错误、累计调用/token 数、版本与截止时间；模型不接触凭据或 checkpoint 连接。DeepSeek 非 thinking 模式，不保存隐藏思维链；外部 LangSmith tracing 显式禁用。
+- PostgreSQL Checkpoint 使用独立 schema 和连接，sync 持久化；CLI 支持 investigate/resume/单工具后暂停。只有初始化建表/迁移串行化，无作业队列、后台调度或完整人工审核。
+- 两个实际运行共用同一图和同一工具集：
+  - 组件 ARR（`f2edf7ec-2a2f-4e8e-a497-3024c7ad4707`）：2 次模型调用、1 次工具调用 `calculate_arr_exposure`；前三组件 PART-010 / PART-007 / PART-003，ARR 732,000 / 417,000 / 395,000，全局 1,041,000。prompt/completion token 为 13,683 / 1,113，模型请求累计 7.525 秒。
+  - Vantara 阻塞（`594eae4b-76ed-41a8-8e5d-c0436573da70`）：7 次模型调用、15 次工具调用。客户搜索 → 机会/开放工单/通话检索 → 读取 TRN-001 与 ISS-017 → 组件候选及补充记录 → 沿 Plan Versioning 文本线索读取 ART-055、ISS-032 → ARR 汇总。prompt/completion token 为 89,232 / 3,006，模型请求累计 27.975 秒。
+- Vantara 在第 1 次工具完成后退出进程；新 CLI 进程仅给 run_id 即继续到完成。历史 checkpoint 确认当时 model_calls=1、tool_calls=1、next=agent，最终 7/15；客户搜索只执行一次，证据与计数保留。累计模型请求耗时不含人为暂停或数据库时间。
+- 两个草稿所引用的证据 ID 均存在于实际工具返回中；实际执行 call_id 均能匹配 DeepSeek 返回的请求。完整本地消息和 Trace 位于忽略目录 `outputs/<run_id>.json`，摘要校验位于 `outputs/m1-agent-verification.json`。
+- 保留失败/限制样本：首轮 ARR 请求因逐个补读名称耗尽 20 次工具预算而返回 partial（`56ddbb01-5887-4cd7-93cc-862e889b5f24`）；工具已补齐展示名称、模型能看到剩余预算，未提高默认上限。
+- 歧义样本（`d41a4494-a40c-40d0-aafa-d2de163e6bac`）把“区域”解释为地理区域，并自行计算额外金额。即使工具计算正确、图状态 completed、引用 ID 存在，也不代表报告合格。此样本明确不作为业务答案通过证据，留待交付项 4 的口径与主张校验。
+- 已修复首次并发启动的 checkpoint DDL 竞争（初始化短轮询锁，避免阻塞事务与并发建索引死锁），并在全新独立测试 schema 并发启动两次复验；修复 Windows GBK 终端输出 Unicode 时的异常，JSON 文件始终使用 UTF-8。
+- 新增 5 项 Agent 测试覆盖预算路由、模型失败、时间预算、重建连接恢复/重复 resume 和首次并发初始化；沿用已有 18 项业务测试，不重复建立相同业务逻辑测试。最终 `uv run --env-file .env pytest -q`：23 passed（31.95s），无跳过；`uv build` 已通过。
+- `completed` 仅指图执行结束，所有报告显式标记 `report_validation=pending_delivery_4`；不宣称交付项 4、5 或 M1 全部完成。
 
 ## 实施边界与验收建议
 
@@ -55,5 +71,7 @@
 
 ## 待解决
 
-- 尚无 Agent 模型调用、动态路径、checkpoint 恢复和端到端调查实证。
-- 后续模型调用只发送调查所需的合成业务记录；尚未进行业务数据模型请求或外发 trace，模型质量与延迟仍待验证。
+- 报告尚无独立的主张支持、金额口径和调查覆盖校验；已观察到歧义导致额外地理聚合，及 Vantara 的宽泛组件候选检索未取全，需在交付项 4 显示缺口并防止误报完整。
+- 模型可能检索过多无关记录、累计输入用量偏大，暂不以当前少量运行宣称稳定成功率或成本达标；三场景各 3 次验收仍待交付项 5。
+- 默认绝对 180 秒预算包含暂停时间；中途崩溃可能重读未完成的只读工具。未实现并发恢复控制、长暂停延期、跨图版本迁移和生产级容错，这些不是本次最小恢复承诺。
+- API 暂未自动重试；工具错误、来源冲突和预算不足的报告行为仍需交付项 4 验证。仅发送所需合成业务记录，未外发 trace。

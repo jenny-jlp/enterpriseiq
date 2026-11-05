@@ -26,6 +26,9 @@ def test_exposure_matches_independent_raw_data_baseline(populated, bundle):
         expected_ids = grouped[group["part_id"]]
         assert set(group["account_ids"]) == expected_ids
         assert Decimal(group["arr"]) == sum(Decimal(accounts[key]["arr"]) for key in expected_ids)
+        assert {row["account_id"]: row["account_name"] for row in group["accounts"]} == {
+            key: accounts[key]["account_name"] for key in expected_ids}
+        assert group["part_name"]
     assert set(result["global"]["account_ids"]) == all_accounts
     assert set(result["global"]["ticket_ids"]) == all_tickets
     assert Decimal(result["global"]["arr"]) == sum(Decimal(accounts[key]["arr"]) for key in all_accounts)
