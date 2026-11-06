@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import operator
+import hashlib
+import threading
 from pathlib import Path
 import time
 from typing import Annotated, TypedDict
@@ -19,9 +21,10 @@ from psycopg.rows import dict_row
 from enterpriseiq.dataset import SNAPSHOT_ID
 from enterpriseiq.model import ModelError
 from enterpriseiq.tools import tool_definitions
-from enterpriseiq.reliability import ReportVerifier, report_instructions, semantic_scope, task_requirements
+from enterpriseiq.reliability import ReportVerifier, report_instructions, semantic_scope, repair_feedback
+from enterpriseiq.tasks import task_contract, investigation_gaps
 
-ENGINE_VERSION = "m1-alpha-3"
+ENGINE_VERSION = "m2-enhancement-2"
 SYSTEM_PROMPT = """You are EnterpriseIQ's business investigation agent. Answer the user's question in Chinese.
 Choose your own investigation path using ONLY the supplied read-only business tools. No task-specific workflow is provided.
 Start by briefly stating the investigation goal and the next evidence needed. After seeing results, choose the next useful tool or finish.
@@ -74,6 +77,12 @@ class InvestigationState(TypedDict):
     report_repair_count: int
     report_attempts: Annotated[list[dict], operator.add]
     needs_report_repair: bool
+    task_contract: dict
+    investigation_gaps: list[dict]
+    remaining_seconds: float
+    consecutive_model_failures: int
+    retry_pending: bool
+    usage_incomplete: bool
 
 
 def initial_state(question, model_name, *, max_tool_calls=20, max_seconds=180):
@@ -86,7 +95,9 @@ def initial_state(question, model_name, *, max_tool_calls=20, max_seconds=180):
                 prompt_tokens=0, completion_tokens=0, max_tool_calls=max_tool_calls, max_model_calls=20,
                 deadline=time.time()+max_seconds, status="running", stop_reason="", answer="",
                 draft_answer="", report={}, report_validation="pending", report_repair_count=0,
-                report_attempts=[], needs_report_repair=False)
+                report_attempts=[], needs_report_repair=False, task_contract=task_contract(question),
+                investigation_gaps=[], remaining_seconds=float(max_seconds),
+                consecutive_model_failures=0, retry_pending=False, usage_incomplete=False)
 
 
 def collect_evidence(value):
@@ -111,7 +122,7 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
     verifier = verifier or (ReportVerifier(tools.conn) if hasattr(tools, "conn") else None)
 
     def think(state):
-        scope = semantic_scope(state["question"])
+        scope = state["task_contract"]["scope"]
         if scope in ("clarification_required", "unsupported_geographic_arr"):
             return {"stop_reason": scope}
         if time.time() >= state["deadline"]:
@@ -119,16 +130,38 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
         if state["model_calls"] >= state["max_model_calls"]:
             return {"stop_reason": "model_call_budget"}
         number = state["model_calls"] + 1
+        if state.get("retry_pending"):
+            time.sleep(min(0.25 * state["consecutive_model_failures"], max(0, state["deadline"]-time.time())))
+            if time.time() >= state["deadline"]:
+                return {"stop_reason": "time_budget", "retry_pending": False}
         start = time.perf_counter()
         try:
+            requirements = {key: value for key, value in state["task_contract"].items()
+                            if key not in ("version", "snapshot_id", "question", "limits")}
             budget = {"role": "system", "content": f"Remaining budget: {state['max_tool_calls']-state['tool_calls']} tool calls, "
                       f"{state['max_model_calls']-state['model_calls']} model calls. If remaining evidence is sufficient, answer now; otherwise query only the missing facts.\n"
-                      + report_instructions() + f"\nExpected report scope: {scope}. Required output contract: " + json.dumps(task_requirements(state["question"]), ensure_ascii=False)}
-            reply = model.complete([*state["messages"], budget], tool_definitions(), timeout=max(0.01, min(60, state["deadline"]-time.time())))
+                      + "Task constraints (INPUT ONLY, not a report schema): " + json.dumps(requirements, ensure_ascii=False)
+                      + "\nObserved evidence gaps (pending_validation is NOT verified): " + json.dumps(investigation_gaps(state), ensure_ascii=False)
+                      + "\nOUTPUT FORMAT:\n" + report_instructions()
+                      + "\nThe final JSON has exactly these top-level keys: scope, claims, open_questions. "
+                        "Never copy task metadata, version, snapshot_id, question, requirements or gaps into the final JSON."}
+            # Preserve M1's initial policy + trailing execution-constraint layout.
+            # The current correction must be in that final constraint, not hidden
+            # before a later system message. Keep originals in State for audit.
+            corrections = [m["content"] for m in state["messages"] if m["role"] == "system" and "Independent report validation" in m["content"]]
+            if corrections:
+                budget["content"] += "\n\nCURRENT CORRECTION REQUIRED:\n" + corrections[-1]
+            request = [state["messages"][0], *[m for m in state["messages"] if m["role"] != "system"], budget]
+            reply = model.complete(request, tool_definitions(), timeout=max(0.01, min(60, state["deadline"]-time.time())))
         except ModelError as exc:
-            return {"model_calls": number, "stop_reason": exc.code,
-                    "errors": [{"stage": "model", "code": exc.code}],
-                    "trace": {f"model-{number}": {"type": "model", "number": number, "at": timestamp(), "error": exc.code}}}
+            failures = state.get("consecutive_model_failures", 0) + 1
+            retry = (exc.code in {"model_http_429", "model_http_500", "model_http_502", "model_http_503", "model_http_504", "model_timeout", "model_connection_error"}
+                     and failures <= 2 and number < state["max_model_calls"] and time.time() < state["deadline"])
+            return {"model_calls": number, "stop_reason": "" if retry else exc.code,
+                    "consecutive_model_failures": failures, "retry_pending": retry, "usage_incomplete": True,
+                    "errors": [] if retry else [{"stage": "model", "code": exc.code}],
+                    "trace": {f"model-{number}": {"type": "model", "number": number, "at": timestamp(), "error": exc.code,
+                        "elapsed_seconds": round(time.perf_counter()-start, 3), "retry_scheduled": retry, "usage_unknown": True}}}
         calls = reply.message.get("tool_calls", [])
         finished = not calls
         reason = "answered" if finished and reply.finish_reason == "stop" and reply.message["content"].strip() else ""
@@ -137,6 +170,8 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
         if time.time() >= state["deadline"]:
             reason = "time_budget"
         return {"messages": [reply.message], "pending_calls": calls, "model_calls": number,
+                "consecutive_model_failures": 0, "retry_pending": False,
+                "investigation_gaps": investigation_gaps(state),
                 "prompt_tokens": state["prompt_tokens"]+reply.usage.get("prompt_tokens", 0),
                 "completion_tokens": state["completion_tokens"]+reply.usage.get("completion_tokens", 0),
                 "answer": reply.message["content"] if finished else state["answer"], "stop_reason": reason,
@@ -181,6 +216,8 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
                 "trace": {f"tool-{number}": event}, "errors": errors}
 
     def after_model(state):
+        if state.get("retry_pending") and not state["stop_reason"]:
+            return "agent"
         return "finish" if state["stop_reason"] else "tools"
 
     def after_tool(state):
@@ -189,10 +226,18 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
         return "tools" if state["pending_calls"] else "agent"
 
     def finish(state):
-        try:
-            verified = verifier.verify(state) if verifier else None
-        except (ValueError, KeyError, TypeError, psycopg.Error):
-            verified = None
+        if state["stop_reason"] in ("clarification_required", "unsupported_geographic_arr"):
+            # No draft is expected before scope is established; this is an input
+            # boundary, not a malformed-model-response failure.
+            verified = {"status": "failed", "report_validation": "blocked", "report": {
+                "formal_report": None, "verified_claims": [], "conflicts": [], "rejected_claims": [],
+                "scope": state["task_contract"]["scope"], "task_requirements": state["task_contract"],
+                "gaps": [{"code": state["stop_reason"]}], "open_questions_unverified": []}}
+        else:
+            try:
+                verified = verifier.verify(state) if verifier else None
+            except (ValueError, KeyError, TypeError, psycopg.Error):
+                verified = None
         if verified is None:
             verified = {"status": "partial" if state["evidence"] else "failed", "report_validation": "blocked",
                         "report": {"formal_report": None, "verified_claims": [], "gaps": [{"code": "verification_failed"}], "conflicts": [], "rejected_claims": []}}
@@ -202,6 +247,7 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
             report["formal_report"] = None
             report["gaps"].append({"code": "time_budget"})
             verified["status"], verified["report_validation"] = "partial", "blocked"
+        verified["investigation_gaps"] = investigation_gaps(state, verified)
         repairable = (verified["report_validation"] == "blocked" and state["stop_reason"] == "answered"
                       and not state["errors"] and not report.get("conflicts")
                       and state.get("report_repair_count", 0) < 1
@@ -210,7 +256,7 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
         if repairable:
             feedback = {"role": "system", "content": "Independent report validation rejected this draft. You have ONE correction opportunity within the original budget. "
                         "Use only original evidence, fix unsupported fields/claims, or fetch missing pages. Do not discard conflicting evidence or change the requested scope. "
-                        "Return a corrected typed report. Validation findings: " + json.dumps(report["gaps"], ensure_ascii=False)}
+                        "Return a corrected typed report. Validation findings: " + json.dumps(repair_feedback(state, report), ensure_ascii=False)}
             return {**verified, "draft_answer": state["answer"], "messages": [feedback], "answer": "",
                     "stop_reason": "", "report_repair_count": state.get("report_repair_count", 0)+1,
                     "report_attempts": [attempt], "needs_report_repair": True}
@@ -231,7 +277,7 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
     builder.add_node("tools", use_tool)
     builder.add_node("finish", finish)
     builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", after_model, {"tools": "tools", "finish": "finish"})
+    builder.add_conditional_edges("agent", after_model, {"tools": "tools", "finish": "finish", "agent": "agent"})
     builder.add_conditional_edges("tools", after_tool, {"tools": "tools", "agent": "agent", "finish": "finish"})
     builder.add_conditional_edges("finish", lambda state: "agent" if state.get("needs_report_repair") else "end", {"agent": "agent", "end": END})
     return builder.compile(checkpointer=checkpointer, interrupt_after=["tools"] if pause_after_tool else None)
@@ -259,7 +305,51 @@ def postgres_checkpointer(dsn):
         yield saver
 
 
-def execute_run(graph, *, state=None, run_id=None):
+_local_locks = {}
+_locks_guard = threading.Lock()
+
+
+@contextmanager
+def run_lock(graph, run_id):
+    """Session-scoped DB lock covers read, invoke and checkpoint reconciliation."""
+    with _locks_guard:
+        lock = _local_locks.setdefault(run_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise ValueError("Run is already executing")
+    try:
+        with _database_run_lock(graph, run_id):
+            yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _database_run_lock(graph, run_id):
+    conn = getattr(graph.checkpointer, "conn", None)
+    key = int.from_bytes(hashlib.sha256(("enterpriseiq-run:"+run_id).encode()).digest()[:8], "big", signed=True)
+    if conn is not None:
+        row = conn.execute("SELECT pg_try_advisory_lock(%s) AS acquired", (key,)).fetchone()
+        acquired = row["acquired"] if isinstance(row, dict) else row[0]
+        if not acquired:
+            raise ValueError("Run is already executing")
+        try:
+            yield
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (key,))
+    else:
+        yield
+
+
+def execute_run(graph, *, state=None, run_id=None, clarification=None, on_result=None):
+    run_id = state["run_id"] if state else run_id
+    with run_lock(graph, run_id):
+        result = _execute_run(graph, state=state, run_id=run_id, clarification=clarification)
+        if on_result:
+            on_result(result)
+        return result
+
+
+def _execute_run(graph, *, state=None, run_id=None, clarification=None):
     run_id = state["run_id"] if state else run_id
     config = {"configurable": {"thread_id": run_id}, "recursion_limit": 250}
     saved = graph.get_state(config)
@@ -272,10 +362,38 @@ def execute_run(graph, *, state=None, run_id=None):
             raise ValueError("Checkpoint engine version is incompatible")
         if saved.values.get("snapshot_id") != SNAPSHOT_ID:
             raise ValueError("Checkpoint data snapshot is incompatible")
+        if clarification is not None:
+            if saved.values.get("stop_reason") != "clarification_required" or not clarification.strip():
+                raise ValueError("This run does not accept clarification")
+            question = saved.values["question"] + "\n用户澄清：" + clarification.strip()
+            contract = task_contract(question)
+            if contract["scope"] == "clarification_required":
+                raise ValueError("Clarification must specify product components or geographic grouping")
+            graph.update_state(config, {"question": question, "task_contract": contract, "stop_reason": "",
+                "status": "running", "report_validation": "pending", "report": {}, "answer": "",
+                "pending_calls": [], "needs_report_repair": False,
+                "messages": [{"role": "user", "content": "用户澄清："+clarification.strip()}]}, as_node="tools")
+        elif saved.values.get("status") == "awaiting_input":
+            return _snapshot_result(saved)
+        elif not saved.next:
+            return _snapshot_result(saved)
+        if saved.next or clarification is not None:
+            # Saved pauses exclude human waiting. Crash downtime remains conservatively charged.
+            if saved.values.get("status") in ("paused", "awaiting_input"):
+                graph.update_state(config, {"deadline": time.time()+saved.values["remaining_seconds"], "status": "running"},
+                                   as_node="tools" if clarification is not None else None)
     # Never export graph traces to LangSmith implicitly through inherited environment settings.
     with tracing_context(enabled=False):
         graph.invoke(state, config, durability="sync")
     snapshot = graph.get_state(config)
+    remaining = max(0, snapshot.values["deadline"]-time.time())
+    status = "paused" if snapshot.next else "awaiting_input" if snapshot.values.get("stop_reason") == "clarification_required" else snapshot.values["status"]
+    graph.update_state(config, {"remaining_seconds": remaining, "status": status})
+    snapshot = graph.get_state(config)
+    return _snapshot_result(snapshot)
+
+
+def _snapshot_result(snapshot):
     result = dict(snapshot.values)
     result["status"] = "paused" if snapshot.next else result["status"]
     result["next_nodes"] = list(snapshot.next)
@@ -294,6 +412,8 @@ def save_result(result):
 def result_summary(result):
     return {key: result[key] for key in ("run_id", "status", "snapshot_id", "checkpoint_id", "next_nodes",
             "model_calls", "tool_calls", "prompt_tokens", "completion_tokens", "stop_reason", "report_validation", "answer")} | {
+                "task_contract": result.get("task_contract"), "investigation_gaps": result.get("investigation_gaps", []),
+                "usage_incomplete": result.get("usage_incomplete", False), "remaining_seconds": result.get("remaining_seconds"),
                 "report": {key: value for key, value in result.get("report", {}).items() if key != "verified_claims"} | {
                     "verified_claims": [{key: item[key] for key in ("index", "statement")} for item in result.get("report", {}).get("verified_claims", [])]},
                 "tool_trace": [{key: event[key] for key in ("number", "name", "arguments", "status", "complete")}

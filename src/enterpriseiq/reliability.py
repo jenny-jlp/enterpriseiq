@@ -59,7 +59,7 @@ class ExposureClaim(ClosedModel):
 class EtaClaim(ClosedModel):
     kind: Literal["eta"]
     evidence_id: str
-    subject_id: str = Field(pattern=r"^ISS-\d+$")
+    subject_id: str = Field(pattern=r"^ISS-\d+$", description="Source record source_id must equal subject_id, OR the exact quote must explicitly contain subject_id. A generic transcript ETA sentence is only a quote, not an issue-scoped eta claim.")
     field: str | None = None
     quote: str = Field(min_length=8, max_length=1000)
     value: str = Field(description="uncommitted or explicit YYYY-MM-DD")
@@ -99,6 +99,7 @@ def report_instructions():
     return """Your final answer MUST be a JSON object (no markdown fences or prose outside JSON):
 {"scope":"direct_component|global|investigation","claims":[...],"open_questions":[...]}
 Every factual statement must be a typed claim. Do not add narrative statements, custom headings, summaries or arbitrary conclusions.
+Report size limits: claims must contain 1 to 60 items; open_questions must contain at most 10 strings. Combine related pending questions into at most 10 entries without discarding material unknowns.
 Supported claim item JSON schema:
 """ + json.dumps(CLAIM_ADAPTER.json_schema(), ensure_ascii=False) + """
 Rules: field is a slash-prefixed raw record field such as /arr, /status, /acv, /currency.
@@ -108,7 +109,12 @@ ticket_contexts tables reference all needed list_ticket_contexts page call_ids; 
 The verifier checks every row against original sources and renders names/counts/amounts deterministically. Do not copy table values or guess field names.
 Only set top_n if the user requested a top-N subset; otherwise publish the entire collection.
 quote must be an EXACT original substring (no line-number prefixes); for a document field=null, for a record field=/description or another actual text field.
+The quote must occur in THAT evidence_id and THAT field, not merely somewhere in the combined tool results. Keep the report minimal and non-redundant while satisfying every required output.
+When requires_source_actions=true, quote ALL explicit numbered ACTION ITEMS from the read transcripts, either as individual complete original lines or the whole numbered section. Include due/status markers; do not infer that any action is completed.
 An eta claim needs an explicit original quote supporting uncommitted or an explicit date; no inferred deadline.
+ETA attribution is literal: either the evidence's source_id equals subject_id (the issue's own record), OR the exact quote contains subject_id.
+Do NOT turn a generic transcript statement like 'I do not have an ETA' into an issue-scoped eta claim, even if nearby conversation implies the issue.
+Keep such general statements as kind=quote. Do not repeat an already supported issue ETA with weaker, unscoped evidence.
 arr claims MUST use the call_id from calculate_arr_exposure's result, exact account_ids and computed amount/currency.
 For a top-N question include exactly the requested highest N component arr claims, plus a global arr claim if asked; ties are ordered by PART-ID.
 candidate means shared component only; reference means a literal entity ID in the cited original field, never proof of causality.
@@ -117,37 +123,44 @@ open_questions are unverified questions, not conclusions. Tool completeness/erro
 """
 
 
-def semantic_scope(question):
-    money = bool(re.search(r"ARR|收入|敞口", question, re.I))
-    product = bool(re.search(r"组件|产品区域|产品组件|PART[- ]?ID|product area|component", question, re.I))
-    geographic = bool(re.search(r"地理|地理区域|地区|地域|国家|省份|geograph|\bregion\b", question, re.I))
-    # Explicit negation of geographic grouping is not a request for that grouping.
-    if re.search(r"(?:不是|不要按|非|不按|而非|不涉及|并非).{0,8}(?:地理|地区|地域)|not.{0,12}geograph", question, re.I):
-        geographic = False
-    if money and geographic:
-        return "unsupported_geographic_arr"
-    if money and re.search(r"区域|area", question, re.I) and not product:
-        return "clarification_required"
-    aggregate = money and bool(re.search(r"去重|汇总|敞口|总额|总计|最高|前三|前\s*[1-9一二三四五]|排名|\btop\b", question, re.I))
-    return "direct_component" if aggregate and product else "global" if aggregate else "investigation"
+def repair_feedback(state, report):
+    """Identify the rejected assertion, using only the model's draft and observed refs."""
+    try:
+        raw = json.loads(state["answer"])
+        claims = raw.get("claims", []) if isinstance(raw, dict) else []
+    except (ValueError, TypeError):
+        claims = []
+    rejected = []
+    for item in report.get("rejected_claims", []):
+        index = item["index"]
+        claim = claims[index] if isinstance(claims, list) and isinstance(index, int) and 0 <= index < len(claims) else None
+        details = {**item, "rejected_claim": claim}
+        if item["code"] == "quote_not_in_original_source":
+            details["explanation"] = "This exact quote is absent from the referenced evidence_id/field. Correct the source using actual tool results, or remove this unsupported optional claim. Do not repeat this unchanged claim."
+        if isinstance(claim, dict):
+            details["referenced_source_id"] = state.get("evidence", {}).get(claim.get("evidence_id"), {}).get("source_id")
+        rejected.append(details)
+    return {"gaps": report["gaps"], "rejected_assertions": rejected,
+            "correction_rule": "Do not return any rejected assertion unchanged. Correct it using observed sources or omit an unsupported optional claim; preserve all required task outputs and all observed conflicts. Never fabricate a quote or evidence ID."}
 
 
-def task_requirements(question):
-    """Small domain contract, based on requested outputs, never on task IDs or answers."""
-    scope = semantic_scope(question)
-    tickets = bool(re.search(r"工单|tickets?", question, re.I))
-    components = bool(re.search(r"组件|components?|product area", question, re.I))
-    customers = bool(re.search(r"客户|accounts?|customers?", question, re.I))
-    collection = bool(re.search(r"逐一|每[个张条]|全部|所有|for each|\ball\b|\bevery\b", question, re.I))
-    tables = []
-    if scope == "investigation" and tickets and components and customers and collection:
-        tables.append("ticket_contexts")
-    if scope == "direct_component" and (collection or re.search(r"名称|数量|工单数|\bname\b|\bcount\b", question, re.I)):
-        tables.append("arr_exposure")
-    match = re.search(r"(?:前\s*|top\s*|最高的?\s*)(10|[1-9一二三四五六七八九十])", question, re.I)
-    top = int(match[1]) if match and match[1].isdigit() else "一二三四五六七八九十".index(match[1])+1 if match else None
-    priorities = sorted({p.lower() for p in re.findall(r"(?<![A-Za-z0-9])p[0-3](?![A-Za-z0-9])", question, re.I)})
-    return {"required_tables": tables, "top_n": top, "priorities": priorities or None}
+from enterpriseiq.tasks import semantic_scope, task_requirements, task_contract, normalize_question
+
+
+def source_action_items(text):
+    """Only explicit labelled lists; no inferred commitments or semantic extraction."""
+    active, items = False, []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if re.match(r"^\s*(?:ACTION ITEMS|行动项|后续行动)", line, re.I):
+            active = True
+            continue
+        if active:
+            match = re.match(r"^\s*\d+[.)、]\s+(.+)$", line)
+            if match:
+                items.append((line_number, match[1]))
+            elif line.strip():
+                active = False
+    return items
 
 
 def tool_results(state):
@@ -560,21 +573,37 @@ class ReportVerifier:
         gaps = []
         typed = [item["claim"] for item in claims]
         arr = [claim for claim in typed if claim["kind"] == "arr"]
-        question = self.state["question"]
+        question = normalize_question(self.state["question"])
         supplied_tables = {c["view"] for c in typed if c["kind"] == "table"}
         for required in self.contract["required_tables"]:
             if required not in supplied_tables:
                 gaps.append({"code": "required_table_missing", "view": required})
+        cited = {self.offered[ref].get("source_id") for c in claims for ref in c.get("evidence_ids", []) if ref in self.offered}
+        for entity in self.contract["entity_ids"]:
+            if entity not in cited:
+                gaps.append({"code": "requested_entity_not_supported", "entity_id": entity})
+        if self.contract["requires_source_actions"]:
+            inspected = set()
+            for ref_id, (ref, text) in self.resolved.items():
+                if ref.get("entity_type") != "transcript" or not isinstance(text, str) or ref["source_path"] in inspected:
+                    continue
+                inspected.add(ref["source_path"])
+                original = self._file(ref["source_path"])[0]
+                quotes = [c["quote"] for c in typed if c["kind"] == "quote" and c["field"] is None
+                          and self.offered.get(c["evidence_id"], {}).get("source_path") == ref["source_path"]]
+                missing = [line for line, action in source_action_items(original)
+                           if not any(action in quote for quote in quotes)]
+                if missing:
+                    gaps.append({"code": "source_actions_not_covered", "source_id": ref["source_id"],
+                                 "missing_lines": missing, "evidence_id": ref_id})
         if scope == "global" and not any(c["scope"] == "global" for c in arr):
             gaps.append({"code": "missing_global_calculation"})
         if scope == "direct_component":
             component = [c for c in arr if c["scope"] == "component"]
             if not component:
                 gaps.append({"code": "missing_component_calculation"})
-            top = re.search(r"(?:前\s*|top\s*|最高的?\s*)([1-9一二三四五六七八九十])", question, re.I)
-            if top and component:
-                value = top[1]
-                count = int(value) if value.isdigit() else "一二三四五六七八九十".index(value)+1
+            count = self.contract["top_n"]
+            if count and component:
                 priorities = self.expected_priorities
                 if priorities is None:
                     priorities = set(TOOL_SPECS["calculate_arr_exposure"][0].model_validate(
@@ -618,10 +647,13 @@ class ReportVerifier:
         for call in self.calls.values():
             if call.get("result", {}).get("status") == "ok":
                 collect(call["result"])
-        scope = semantic_scope(state["question"])
-        self.contract = task_requirements(state["question"])
+        contract = task_contract(state["question"])
+        scope = contract["scope"]
+        self.contract = contract
         self.expected_priorities = set(self.contract["priorities"]) if self.contract["priorities"] else None
         gaps = coverage_gaps(state)
+        if state.get("task_contract", contract) != contract:
+            gaps.append({"code": "task_contract_mismatch"})
         if state.get("stop_reason") != "answered":
             gaps.append({"code": state.get("stop_reason") or "investigation_not_finished"})
         if state.get("errors"):
@@ -664,8 +696,16 @@ class ReportVerifier:
                         claims.append({"index": index, "claim": claim.model_dump(), "statement": statement+citation, "evidence_ids": refs})
                     except (ValidationError, UnsupportedClaim, KeyError, TypeError, InvalidOperation) as exc:
                         code = str(exc) if isinstance(exc, UnsupportedClaim) else "invalid_claim_schema"
-                        rejected.append({"index": index, "code": code})
-        except (ValidationError, ValueError, TypeError):
+                        rejected_item = {"index": index, "code": code}
+                        if code == "eta_subject_not_supported":
+                            rejected_item["explanation"] = "The exact quote does not contain subject_id and this source is not that issue's record. Keep general statements as kind=quote; do not repeat this unscoped eta."
+                        rejected.append(rejected_item)
+        except ValidationError as exc:
+            gaps.append({"code": "unstructured_or_invalid_report", "schema_errors": [
+                {"location": list(error["loc"]), "type": error["type"],
+                 **{k: v for k, v in error.get("ctx", {}).items() if k in ("max_length", "min_length")}}
+                for error in exc.errors(include_url=False, include_input=False)]})
+        except (ValueError, TypeError):
             gaps.append({"code": "unstructured_or_invalid_report"})
         # Inspect all observed evidence for known explicit conflicts, even if omitted from the draft.
         for ref_id in self.offered:
@@ -698,6 +738,8 @@ class ReportVerifier:
         if not claims:
             gaps.append({"code": "no_verified_claims"})
         gaps.extend(self._requirements(scope, claims))
+        if self.contract["requires_open_questions"] and not open_questions:
+            gaps.append({"code": "required_open_questions_missing"})
         # Incomplete or ambiguous runs never publish a formal report.
         accepted = bool(claims) and not gaps
         status = "completed" if accepted else "partial" if claims or self.offered else "failed"
