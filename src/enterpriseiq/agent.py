@@ -19,9 +19,9 @@ from psycopg.rows import dict_row
 from enterpriseiq.dataset import SNAPSHOT_ID
 from enterpriseiq.model import ModelError
 from enterpriseiq.tools import tool_definitions
-from enterpriseiq.reliability import ReportVerifier, report_instructions, semantic_scope
+from enterpriseiq.reliability import ReportVerifier, report_instructions, semantic_scope, task_requirements
 
-ENGINE_VERSION = "m1-alpha-2"
+ENGINE_VERSION = "m1-alpha-3"
 SYSTEM_PROMPT = """You are EnterpriseIQ's business investigation agent. Answer the user's question in Chinese.
 Choose your own investigation path using ONLY the supplied read-only business tools. No task-specific workflow is provided.
 Start by briefly stating the investigation goal and the next evidence needed. After seeing results, choose the next useful tool or finish.
@@ -31,6 +31,8 @@ Use only actual tool results for facts. Never use prior benchmark knowledge, gue
 Read source text when a question needs commitments, blockers or next actions; document metadata alone cannot support those claims.
 Shared components are candidate impact paths, NOT confirmed root causes. Preserve explicit text references separately.
 Use calculate_arr_exposure for aggregated ARR; do not do financial arithmetic yourself. Keep ARR/ACV separate and preserve currency limitations.
+For ticket/customer/component investigations consider list_ticket_contexts: it batches the joins and provides exact open-issue existence/count with representatives.
+Do not enumerate all engineering issues just to establish existence. Read individual records only when more source detail is needed.
 Evidence references already give authoritative source lineage. Do not fetch the same entities merely to repeat citations or names already returned.
 Keep each next batch within the remaining tool budget. Seek only additional information needed to answer this question.
 Follow next_offset / next_line when the requested scope requires full coverage. A final page does not prove earlier pages were read.
@@ -121,7 +123,7 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
         try:
             budget = {"role": "system", "content": f"Remaining budget: {state['max_tool_calls']-state['tool_calls']} tool calls, "
                       f"{state['max_model_calls']-state['model_calls']} model calls. If remaining evidence is sufficient, answer now; otherwise query only the missing facts.\n"
-                      + report_instructions() + f"\nExpected report scope: {scope}."}
+                      + report_instructions() + f"\nExpected report scope: {scope}. Required output contract: " + json.dumps(task_requirements(state["question"]), ensure_ascii=False)}
             reply = model.complete([*state["messages"], budget], tool_definitions(), timeout=max(0.01, min(60, state["deadline"]-time.time())))
         except ModelError as exc:
             return {"model_calls": number, "stop_reason": exc.code,

@@ -107,6 +107,6 @@ def test_vantara_profile_opportunity_and_document_source_ranges(populated, bundl
 
 def test_tool_definitions_have_closed_typed_schemas():
     definitions = tool_definitions()
-    assert len(definitions) == 8
+    assert len(definitions) == 9
     for tool in definitions:
         assert tool["function"]["parameters"]["additionalProperties"] is False

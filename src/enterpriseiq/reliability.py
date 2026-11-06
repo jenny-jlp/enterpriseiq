@@ -65,7 +65,14 @@ class EtaClaim(ClosedModel):
     value: str = Field(description="uncommitted or explicit YYYY-MM-DD")
 
 
-Claim = Annotated[FieldClaim | QuoteClaim | CandidateClaim | ReferenceClaim | ExposureClaim | EtaClaim, Field(discriminator="kind")]
+class TableClaim(ClosedModel):
+    kind: Literal["table"]
+    view: Literal["ticket_contexts", "arr_exposure"]
+    source_call_ids: list[str] = Field(min_length=1, max_length=20)
+    top_n: int | None = Field(default=None, ge=1, le=100)
+
+
+Claim = Annotated[FieldClaim | QuoteClaim | CandidateClaim | ReferenceClaim | ExposureClaim | EtaClaim | TableClaim, Field(discriminator="kind")]
 CLAIM_ADAPTER = TypeAdapter(Claim)
 
 
@@ -75,6 +82,19 @@ class ReportEnvelope(ClosedModel):
     open_questions: list[str] = Field(default_factory=list, max_length=10)
 
 
+def claim_identity(value):
+    normalized = dict(value)
+    if normalized["kind"] == "arr":
+        try:
+            normalized["amount"] = str(Decimal(normalized["amount"]).normalize())
+        except InvalidOperation:
+            pass
+        normalized["account_ids"] = sorted(normalized["account_ids"])
+    if normalized["kind"] == "table":
+        normalized["source_call_ids"] = sorted(normalized["source_call_ids"])
+    return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+
+
 def report_instructions():
     return """Your final answer MUST be a JSON object (no markdown fences or prose outside JSON):
 {"scope":"direct_component|global|investigation","claims":[...],"open_questions":[...]}
@@ -82,6 +102,11 @@ Every factual statement must be a typed claim. Do not add narrative statements, 
 Supported claim item JSON schema:
 """ + json.dumps(CLAIM_ADAPTER.json_schema(), ensure_ascii=False) + """
 Rules: field is a slash-prefixed raw record field such as /arr, /status, /acv, /currency.
+For collections and financial breakdowns use ONE table claim referencing actual tool call_ids, not dozens of copied per-row claims.
+Do not repeat the table's contents as individual field/arr/candidate claims; the verifier expands their original-source proof automatically.
+ticket_contexts tables reference all needed list_ticket_contexts page call_ids; arr_exposure tables reference calculate_arr_exposure.
+The verifier checks every row against original sources and renders names/counts/amounts deterministically. Do not copy table values or guess field names.
+Only set top_n if the user requested a top-N subset; otherwise publish the entire collection.
 quote must be an EXACT original substring (no line-number prefixes); for a document field=null, for a record field=/description or another actual text field.
 An eta claim needs an explicit original quote supporting uncommitted or an explicit date; no inferred deadline.
 arr claims MUST use the call_id from calculate_arr_exposure's result, exact account_ids and computed amount/currency.
@@ -105,6 +130,24 @@ def semantic_scope(question):
         return "clarification_required"
     aggregate = money and bool(re.search(r"去重|汇总|敞口|总额|总计|最高|前三|前\s*[1-9一二三四五]|排名|\btop\b", question, re.I))
     return "direct_component" if aggregate and product else "global" if aggregate else "investigation"
+
+
+def task_requirements(question):
+    """Small domain contract, based on requested outputs, never on task IDs or answers."""
+    scope = semantic_scope(question)
+    tickets = bool(re.search(r"工单|tickets?", question, re.I))
+    components = bool(re.search(r"组件|components?|product area", question, re.I))
+    customers = bool(re.search(r"客户|accounts?|customers?", question, re.I))
+    collection = bool(re.search(r"逐一|每[个张条]|全部|所有|for each|\ball\b|\bevery\b", question, re.I))
+    tables = []
+    if scope == "investigation" and tickets and components and customers and collection:
+        tables.append("ticket_contexts")
+    if scope == "direct_component" and (collection or re.search(r"名称|数量|工单数|\bname\b|\bcount\b", question, re.I)):
+        tables.append("arr_exposure")
+    match = re.search(r"(?:前\s*|top\s*|最高的?\s*)(10|[1-9一二三四五六七八九十])", question, re.I)
+    top = int(match[1]) if match and match[1].isdigit() else "一二三四五六七八九十".index(match[1])+1 if match else None
+    priorities = sorted({p.lower() for p in re.findall(r"(?<![A-Za-z0-9])p[0-3](?![A-Za-z0-9])", question, re.I)})
+    return {"required_tables": tables, "top_n": top, "priorities": priorities or None}
 
 
 def tool_results(state):
@@ -359,6 +402,142 @@ class ReportVerifier:
             return f"{ref['source_id']} 对 {claim.subject_id} 的 ETA 来源观测为 {claim.value}；原文：{claim.quote}"
         return f"{ref['source_id']} 来源原文：{claim.quote}"
 
+    def _proof(self, claim):
+        """Expose original atomic proof as well as a rendered collection, without LLM copying."""
+        statement = self._claim(claim)
+        raw = claim.model_dump()
+        refs = [v for k, v in raw.items() if k.endswith("evidence_id")]
+        if isinstance(claim, ExposureClaim):
+            refs = [r["evidence_id"] for r in self.calls[claim.calculation_call_id]["result"]["evidence"]]
+        return {"claim": raw, "statement": statement, "evidence_ids": refs}
+
+    def _source_ref(self, kind, source_id):
+        for ref_id, ref in self.offered.items():
+            if ref.get("entity_type") == kind and ref.get("source_id") == source_id:
+                self._resolve(ref_id)
+                return ref_id
+        raise UnsupportedClaim("missing_collection_source")
+
+    def _table(self, claim):
+        if len(set(claim.source_call_ids)) != len(claim.source_call_ids):
+            raise UnsupportedClaim("duplicate_collection_call")
+        calls = [self.calls.get(key, {}) for key in claim.source_call_ids]
+        if any(c.get("result", {}).get("status") != "ok" for c in calls):
+            raise UnsupportedClaim("collection_call_not_successful")
+        if claim.top_n != self.contract["top_n"]:
+            raise UnsupportedClaim("collection_subset_not_requested")
+        if claim.view == "arr_exposure":
+            if len(calls) != 1 or calls[0].get("name") != "calculate_arr_exposure" or not calls[0]["result"].get("complete"):
+                raise UnsupportedClaim("calculation_not_complete")
+            result = calls[0]["result"]
+            priorities = TOOL_SPECS["calculate_arr_exposure"][0].model_validate(calls[0]["arguments"]).priorities
+            if self.expected_priorities is not None and set(priorities) != self.expected_priorities:
+                raise UnsupportedClaim("wrong_priority_scope")
+            parts = {p["part_id"]: p for p in self._json("pm_json_data/maple_parts.json")}
+            tickets = [t for t in self._json("crm_json_data/tickets.json") if t["status"] == "open" and t["priority"] in priorities]
+            expected_parts = {p for t in tickets for p in t["components"]}
+            groups = result.get("groups", [])
+            if len(groups) != len(expected_parts) or {g["part_id"] for g in groups} != expected_parts:
+                raise UnsupportedClaim("missing_collection_rows")
+            groups = sorted(groups, key=lambda g: (-Decimal(g["arr"]), g["part_id"]))
+            if claim.top_n is not None:
+                groups = groups[:claim.top_n]
+            rows, proofs = [], []
+            for group in groups:
+                part_id = group["part_id"]
+                ticket_count = len({t["ticket_id"] for t in tickets if part_id in t["components"]})
+                if group.get("part_name") != parts[part_id]["title"] or group.get("ticket_count") != ticket_count:
+                    raise UnsupportedClaim("derived_collection_value_mismatch")
+                amount = ExposureClaim(kind="arr", calculation_call_id=claim.source_call_ids[0], scope="component",
+                    part_id=part_id, amount=group["arr"], account_ids=group["account_ids"], currency=result["currency"])
+                proof = self._proof(amount)
+                proof["statement"] += f" 组件名称={parts[part_id]['title']}；开放工单数量 = {ticket_count}；"
+                proofs.append(proof)
+                proofs.append(self._proof(FieldClaim(kind="field", evidence_id=self._source_ref("part", part_id), field="/title", value=parts[part_id]["title"])))
+                rows.append({"part_id": part_id, "part_name": parts[part_id]["title"], "arr": group["arr"],
+                    "ticket_count": ticket_count, "account_ids": group["account_ids"], "currency": result["currency"]})
+            output = {"view": claim.view, "columns": ["part_id", "part_name", "arr", "ticket_count", "account_ids", "currency"], "rows": rows,
+                      "source_call_ids": claim.source_call_ids}
+            if re.search(r"全局|global", self.state["question"], re.I):
+                proofs.append(self._proof(ExposureClaim(kind="arr", calculation_call_id=claim.source_call_ids[0], scope="global",
+                    amount=result["global"]["arr"], account_ids=result["global"]["account_ids"], currency=result["currency"])))
+                output["global"] = result["global"]
+            return output, proofs
+
+        if any(c.get("name") != "list_ticket_contexts" for c in calls) or claim.top_n is not None:
+            raise UnsupportedClaim("wrong_collection_source")
+        specs = [TOOL_SPECS["list_ticket_contexts"][0].model_validate(c["arguments"]) for c in calls]
+        filters = [{k: v for k, v in s.model_dump().items() if k not in ("offset", "limit")} for s in specs]
+        if any(f != filters[0] for f in filters):
+            raise UnsupportedClaim("mixed_collection_scope")
+        spec = specs[0]
+        if self.expected_priorities is not None and set(spec.priorities) != self.expected_priorities:
+            raise UnsupportedClaim("wrong_priority_scope")
+        accounts = {a["account_id"]: a for a in self._json("crm_json_data/accounts.json")}
+        if "ticket_contexts" in self.contract["required_tables"]:
+            q = self.state["question"]
+            mentioned = set(re.findall(r"(?<![A-Za-z0-9])ACC-\d+(?![A-Za-z0-9])", q))
+            mentioned.update(a for a in accounts if accounts[a]["account_name"].casefold() in q.casefold())
+            named_parts = set(re.findall(r"(?<![A-Za-z0-9])PART-\d+(?![A-Za-z0-9])", q))
+            if (set([spec.account_id]) if spec.account_id else set()) != mentioned or (set([spec.part_id]) if spec.part_id else set()) != named_parts:
+                raise UnsupportedClaim("collection_scope_narrowed")
+        selected = {t["ticket_id"]: t for t in self._json("crm_json_data/tickets.json") if t["status"] == "open" and t["priority"] in spec.priorities
+                    and (spec.account_id is None or t["account_id"] == spec.account_id)
+                    and (spec.part_id is None or spec.part_id in t["components"])}
+        by_id = {}
+        for call in calls:
+            result = call["result"]
+            if result.get("total_matches") != len(selected) or result.get("missing_context_ticket_ids") or result.get("issue_scope") != "exact_existence_and_count_with_representative":
+                raise UnsupportedClaim("incomplete_collection")
+            for item in result["items"]:
+                key = item["data"]["ticket_id"]
+                if key in by_id and by_id[key] != item["data"]:
+                    raise UnsupportedClaim("inconsistent_collection_row")
+                by_id[key] = item["data"]
+        if set(by_id) != set(selected):
+            raise UnsupportedClaim("missing_collection_rows")
+        parts = {p["part_id"]: p for p in self._json("pm_json_data/maple_parts.json")}
+        issues_by_part = defaultdict(list)
+        for issue in self._json("pm_json_data/issues.json"):
+            if issue["status"] == "in_progress":
+                for part in set(issue["components"]):
+                    issues_by_part[part].append(issue)
+        priority_rank = {value: rank for rank, value in enumerate(("highest", "high", "medium", "low", "lowest"))}
+        for issues in issues_by_part.values():
+            issues.sort(key=lambda i: (priority_rank.get(i["priority"], 4), i["issue_id"]))
+        rows, proofs = [], []
+        for key, ticket in sorted(selected.items()):
+            account = accounts[ticket["account_id"]]
+            if account.get("arr") is None:
+                raise UnsupportedClaim("missing_arr")
+            expected_components = []
+            ticket_ref = self._source_ref("ticket", key)
+            for field, value in (("subject", ticket["subject"]), ("components", ticket["components"]), ("account_id", ticket["account_id"])):
+                proofs.append(self._proof(FieldClaim(kind="field", evidence_id=ticket_ref, field="/"+field, value=value)))
+            for field in ("account_name", "arr"):
+                proofs.append(self._proof(FieldClaim(kind="field", evidence_id=self._source_ref("account", account["account_id"]), field="/"+field, value=account[field])))
+            for part_id in ticket["components"]:
+                matches = issues_by_part[part_id]
+                witness = matches[0] if matches else None
+                expected_components.append({"part_id": part_id, "part_name": parts[part_id]["title"], "open_issue_count": len(matches),
+                    "representative_issue_id": witness["issue_id"] if witness else None, "representative_issue_status": "in_progress" if witness else None,
+                    "enumeration_complete": len(matches) <= 1, "existence_and_count_complete": True, "relation_type": "shared_component"})
+                proofs.append(self._proof(FieldClaim(kind="field", evidence_id=self._source_ref("part", part_id), field="/title", value=parts[part_id]["title"])))
+                if witness:
+                    issue_ref = self._source_ref("issue", witness["issue_id"])
+                    proofs.append(self._proof(FieldClaim(kind="field", evidence_id=issue_ref, field="/status", value="in_progress")))
+                    proofs.append(self._proof(CandidateClaim(kind="candidate", ticket_evidence_id=ticket_ref, issue_evidence_id=issue_ref, part_id=part_id)))
+            expected = {"ticket_id": key, "subject": ticket["subject"], "account_id": account["account_id"], "account_name": account["account_name"],
+                        "arr": str(account["arr"]), "components": expected_components}
+            if by_id[key] != expected:
+                raise UnsupportedClaim("derived_collection_value_mismatch")
+            if re.search(r"(?:全部|所有).{0,8}工程问题|all\s+(?:open\s+)?engineering issues", self.state["question"], re.I) and any(not c["enumeration_complete"] for c in expected_components):
+                raise UnsupportedClaim("issue_enumeration_not_complete")
+            rows.append({**expected, "currency": "UNSPECIFIED_BENCHMARK"})
+        return {"view": claim.view, "columns": ["ticket_id", "subject", "components", "account_id", "account_name", "arr", "currency"],
+                "rows": rows, "source_call_ids": claim.source_call_ids,
+                "issue_scope": "exact_existence_and_count_with_representative"}, proofs
+
     def _conflicts(self):
         facts = defaultdict(lambda: defaultdict(set))
         for ref_id, (ref, content) in self.resolved.items():
@@ -382,6 +561,10 @@ class ReportVerifier:
         typed = [item["claim"] for item in claims]
         arr = [claim for claim in typed if claim["kind"] == "arr"]
         question = self.state["question"]
+        supplied_tables = {c["view"] for c in typed if c["kind"] == "table"}
+        for required in self.contract["required_tables"]:
+            if required not in supplied_tables:
+                gaps.append({"code": "required_table_missing", "view": required})
         if scope == "global" and not any(c["scope"] == "global" for c in arr):
             gaps.append({"code": "missing_global_calculation"})
         if scope == "direct_component":
@@ -436,7 +619,8 @@ class ReportVerifier:
             if call.get("result", {}).get("status") == "ok":
                 collect(call["result"])
         scope = semantic_scope(state["question"])
-        self.expected_priorities = {"p0", "p1"} if re.search(r"p0\s*[/、和与,]\s*p1", state["question"], re.I) else {"p1"} if re.search(r"\bp1\b", state["question"], re.I) else None
+        self.contract = task_requirements(state["question"])
+        self.expected_priorities = set(self.contract["priorities"]) if self.contract["priorities"] else None
         gaps = coverage_gaps(state)
         if state.get("stop_reason") != "answered":
             gaps.append({"code": state.get("stop_reason") or "investigation_not_finished"})
@@ -447,7 +631,8 @@ class ReportVerifier:
         row = self.conn.execute("SELECT archive_sha256 FROM enterpriseiq.snapshots WHERE snapshot_id=%s", (SNAPSHOT_ID,)).fetchone()
         if state.get("snapshot_id") != SNAPSHOT_ID or not row or row[0] != ARCHIVE_SHA256:
             gaps.append({"code": "snapshot_integrity"})
-        claims, rejected, open_questions = [], [], []
+        claims, rejected, open_questions, tables = [], [], [], []
+        declared_tables = set()
         try:
             draft = ReportEnvelope.model_validate(json.loads(state.get("answer", "")))
             open_questions = draft.open_questions
@@ -457,6 +642,18 @@ class ReportVerifier:
                 for index, raw in enumerate(draft.claims):
                     try:
                         claim = CLAIM_ADAPTER.validate_python(raw)
+                        if isinstance(claim, TableClaim):
+                            identity = claim_identity(claim.model_dump())
+                            if identity in declared_tables:
+                                continue
+                            table, proofs = self._table(claim)
+                            declared_tables.add(identity)
+                            statement = render_table(table)
+                            tables.append(table)
+                            claims.append({"index": index, "claim": claim.model_dump(), "statement": statement,
+                                           "evidence_ids": sorted({ref for p in proofs for ref in p["evidence_ids"]})})
+                            claims.extend({"index": index, **proof, "from_table": True} for proof in proofs)
+                            continue
                         statement = self._claim(claim)
                         if isinstance(claim, ExposureClaim):
                             refs = [ref["evidence_id"] for ref in self.calls[claim.calculation_call_id]["result"].get("evidence", [])]
@@ -489,6 +686,15 @@ class ReportVerifier:
             claims = kept
         if rejected:
             gaps.append({"code": "unsupported_claims", "claims": rejected})
+        # A table is the canonical presentation of its collection. Prefer its independently
+        # ordered proof, and suppress semantically identical copied facts without hiding errors.
+        original_count, unique, seen = len(claims), [], set()
+        for item in [c for c in claims if c.get("from_table")] + [c for c in claims if not c.get("from_table")]:
+            identity = claim_identity(item["claim"])
+            if identity not in seen:
+                unique.append(item)
+                seen.add(identity)
+        claims = unique
         if not claims:
             gaps.append({"code": "no_verified_claims"})
         gaps.extend(self._requirements(scope, claims))
@@ -497,5 +703,29 @@ class ReportVerifier:
         status = "completed" if accepted else "partial" if claims or self.offered else "failed"
         return {"status": status, "report_validation": "passed" if accepted else "blocked",
                 "report": {"scope": scope, "verified_claims": claims, "rejected_claims": rejected,
+                           "task_requirements": self.contract, "tables": tables,
+                           "duplicate_claims_removed": original_count-len(claims),
                            "gaps": gaps, "conflicts": conflicts, "open_questions_unverified": open_questions,
-                           "formal_report": "\n".join(item["statement"] for item in claims) if accepted else None}}
+                           "formal_report": "\n".join(item["statement"] for item in claims if not item.get("from_table")) if accepted else None}}
+
+
+def render_table(table):
+    """Render only independently checked rows; names and counts cannot be deleted by the model."""
+    def cell(value):
+        return str(value).replace("|", "\\|").replace("\n", " ")
+
+    if table["view"] == "arr_exposure":
+        lines = ["| PART-ID | 组件名称 | ARR | 开放工单数量 | 客户 ID | 币种 |", "|---|---|---:|---:|---|---|"]
+        for row in table["rows"]:
+            lines.append("| " + " | ".join(cell(v) for v in (row["part_id"], row["part_name"], row["arr"], row["ticket_count"], ", ".join(row["account_ids"]), row["currency"])) + " |")
+        if "global" in table:
+            lines.append("全局客户去重 ARR = " + table["global"]["arr"] + "；不可累加各组件金额。")
+    else:
+        lines = ["| Ticket ID | Subject | 产品组件 | 未完成工程问题（候选） | 客户 ID / 名称 | ARR |", "|---|---|---|---|---|---:|"]
+        for row in table["rows"]:
+            components = "; ".join(c["part_id"]+" / "+c["part_name"] for c in row["components"])
+            issues = "; ".join((c["representative_issue_id"] or "none") + f"（匹配 {c['open_issue_count']}；代表记录，非全量枚举）" for c in row["components"])
+            lines.append("| " + " | ".join(cell(v) for v in (row["ticket_id"], row["subject"], components, issues, row["account_id"]+" / "+row["account_name"], row["arr"])) + " |")
+        lines.append("账户 ARR 币种未指定。共享组件仅为候选关联，不证明根因；未完成 Issue 的存在性与数量取全，列表展示代表记录。")
+    lines.append("来源工具调用：" + ", ".join(table["source_call_ids"]) + "；逐项原始引用见 verified_claims / evidence_ids。")
+    return "\n".join(lines)

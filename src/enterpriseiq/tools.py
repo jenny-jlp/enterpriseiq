@@ -47,6 +47,10 @@ class FindIssues(Page):
     priorities: list[Literal["high", "highest", "medium", "low", "lowest"]] = Field(default_factory=lambda: ["high", "highest"], min_length=1, max_length=5)
 
 
+class ListTicketContexts(ListTickets):
+    limit: int = Field(default=100, ge=1, le=100)
+
+
 class ListOpportunities(Page):
     account_id: str = Field(min_length=1, max_length=80)
 
@@ -71,6 +75,7 @@ TOOL_SPECS = {
     "search_accounts": (SearchAccounts, "Find accounts by a literal name substring. Follow pagination before claiming all matches."),
     "get_record": (GetRecord, "Read an exact business record, its original fields and evidence reference."),
     "list_open_tickets": (ListTickets, "List open tickets, optionally by account or direct component. Default ticket priorities p0/p1."),
+    "list_ticket_contexts": (ListTicketContexts, "Batch open-ticket business context: subjects, customer names/ARR, direct component names, exact unresolved-issue existence/count and one representative per component. Prefer for cross-system ticket lists instead of per-record lookups. Paginated by ticket; issue count/existence is exhaustive, representative is not an enumeration of all issues."),
     "find_component_issues": (FindIssues, "Find unresolved engineering issues sharing supplied components. Candidate association, not proof of root cause. Default high/highest."),
     "list_account_opportunities": (ListOpportunities, "List non-closed opportunities for an account. ACV and explicit currency are separate from account ARR."),
     "list_documents": (ListDocuments, "Find document metadata and content matches. account_id restricts to that account's transcripts; omit it to search KB/internal documents too."),
@@ -164,6 +169,59 @@ class BusinessTools:
         result["relation_type"] = "shared_component"
         return result
 
+    def _list_ticket_contexts(self, args):
+        page = self._list_open_tickets(args)
+        tickets = page["items"]
+        account_ids = sorted({t["data"]["account_id"] for t in tickets})
+        part_ids = sorted({p for t in tickets for p in t["data"]["components"]})
+        related = self._rows(f"SELECT {RECORD_COLUMNS} FROM enterpriseiq.records r WHERE r.snapshot_id=%s AND ("
+            "(r.source_system='crm' AND r.entity_type='account' AND r.source_id=ANY(%s)) OR "
+            "(r.source_system='pm' AND r.entity_type='part' AND r.source_id=ANY(%s)))",
+            (self.snapshot_id, account_ids, part_ids))
+        records = {(r["entity_type"], r["source_id"]): self._record(r) for r in related}
+        issues = self._rows(f"""WITH matches AS (
+            SELECT DISTINCT c.to_id AS part_id,{RECORD_COLUMNS}
+            FROM enterpriseiq.records r JOIN enterpriseiq.relations c
+              ON (c.snapshot_id,c.from_system,c.from_type,c.from_id)=(r.snapshot_id,r.source_system,r.entity_type,r.source_id)
+            WHERE r.snapshot_id=%s AND r.source_system='pm' AND r.entity_type='issue'
+              AND r.data->>'status'='in_progress' AND c.to_system='pm' AND c.to_type='part'
+              AND c.relation_type='explicit_foreign_key' AND c.to_id=ANY(%s)
+        ), ranked AS (
+            SELECT *,count(*) OVER (PARTITION BY part_id) AS match_count,
+              row_number() OVER (PARTITION BY part_id ORDER BY
+                CASE data->>'priority' WHEN 'highest' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,source_id) AS n
+            FROM matches
+        ) SELECT * FROM ranked WHERE n=1""", (self.snapshot_id, part_ids))
+        issue_by_part = {r["part_id"]: r for r in issues}
+        evidence = {r["evidence"]["evidence_id"]: r["evidence"] for r in records.values()}
+        for issue in issues:
+            ref = self._record(issue)["evidence"]
+            evidence[ref["evidence_id"]] = ref
+        items = []
+        missing = []
+        for ticket in tickets:
+            data = ticket["data"]
+            account = records.get(("account", data["account_id"]))
+            if account is None or any(("part", p) not in records for p in data["components"]):
+                missing.append(data["ticket_id"])
+                continue
+            components = []
+            for part_id in data["components"]:
+                issue = issue_by_part.get(part_id)
+                count = issue["match_count"] if issue else 0
+                components.append({"part_id": part_id, "part_name": records[("part", part_id)]["data"]["title"],
+                    "open_issue_count": count, "representative_issue_id": issue["source_id"] if issue else None,
+                    "representative_issue_status": issue["data"]["status"] if issue else None,
+                    "enumeration_complete": count <= 1, "existence_and_count_complete": True,
+                    "relation_type": "shared_component"})
+            items.append({"data": {"ticket_id": data["ticket_id"], "subject": data["subject"],
+                "account_id": data["account_id"], "account_name": account["data"]["account_name"],
+                "arr": str(account["data"]["arr"]) if account["data"].get("arr") is not None else None,
+                "components": components}, "evidence": ticket["evidence"]})
+        return {**page, "items": items, "returned": len(items), "complete": page["complete"] and not missing,
+                "missing_context_ticket_ids": missing, "evidence": list(evidence.values()),
+                "issue_scope": "exact_existence_and_count_with_representative", "currency": "UNSPECIFIED_BENCHMARK"}
+
     def _list_account_opportunities(self, args):
         return self._page("""r.source_system='crm' AND r.entity_type='opportunity' AND r.data->>'account_id'=%s
             AND r.data->>'stage' NOT IN ('closed_won','closed_lost')""", (args.account_id,), args)
@@ -221,7 +279,7 @@ class BusinessTools:
         def metric(accounts, tickets):
             missing = sorted(key for key, value in accounts.items() if value is None)
             return {"arr": str(sum(accounts.values(), Decimal(0))) if not missing else None,
-                    "account_ids": sorted(accounts), "ticket_ids": sorted(tickets), "missing_arr_account_ids": missing}
+                    "account_ids": sorted(accounts), "ticket_ids": sorted(tickets), "ticket_count": len(tickets), "missing_arr_account_ids": missing}
 
         groups = [{"part_id": part, **metric(values["accounts"], values["tickets"])} for part, values in sorted(by_part.items())]
         # Include source lineage rather than asking a model to reconstruct arithmetic.
