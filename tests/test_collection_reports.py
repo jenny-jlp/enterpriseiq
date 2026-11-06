@@ -1,0 +1,136 @@
+"""Bulk business queries and complete output contracts, independent of benchmark IDs."""
+
+from collections import defaultdict
+from copy import deepcopy
+import json
+
+from enterpriseiq.tools import BusinessTools
+from test_reliability import RecordedRun, codes
+
+
+EXPOSURE_REQUEST = "针对所有开放 p0/p1 工单，按直接产品组件统计去重 ARR，列出每个组件的名称、金额和开放工单数量，按金额从高到低排序。"
+TICKET_REQUEST = "逐一列出所有开放 P1 工单的主题、直接组件 ID 与名称、相关未完成工程问题、客户名称和 ARR。"
+
+
+def table(view, *calls):
+    return {"kind": "table", "view": view, "source_call_ids": [c["call_id"] for c in calls]}
+
+
+def test_batch_ticket_context_matches_original_records_and_exact_issue_counts(populated, bundle):
+    tools = BusinessTools(populated)
+    raw = lambda path: json.loads(bundle.files[path])
+    accounts = {a["account_id"]: a for a in raw("crm_json_data/accounts.json")}
+    parts = {p["part_id"]: p for p in raw("pm_json_data/maple_parts.json")}
+    issues = raw("pm_json_data/issues.json")
+    for priorities in (["p1"], ["p2"]):
+        expected = {t["ticket_id"]: t for t in raw("crm_json_data/tickets.json") if t["status"] == "open" and t["priority"] in priorities}
+        result = tools.execute("list_ticket_contexts", {"priorities": priorities})
+        assert result["status"] == "ok" and result["complete"] is True
+        assert {r["data"]["ticket_id"] for r in result["items"]} == set(expected)
+        for item in result["items"]:
+            row = item["data"]
+            ticket = expected[row["ticket_id"]]
+            assert row["account_name"] == accounts[ticket["account_id"]]["account_name"]
+            assert row["arr"] == str(accounts[ticket["account_id"]]["arr"])
+            assert {c["part_id"] for c in row["components"]} == set(ticket["components"])
+            for component in row["components"]:
+                matches = [i for i in issues if i["status"] == "in_progress" and component["part_id"] in i["components"]]
+                assert component["part_name"] == parts[component["part_id"]]["title"]
+                assert component["open_issue_count"] == len(matches)
+                assert component["representative_issue_id"] in {i["issue_id"] for i in matches}
+                assert component["enumeration_complete"] is (len(matches) <= 1)
+        assert result["issue_scope"] == "exact_existence_and_count_with_representative"
+
+
+def test_correct_arr_without_required_names_counts_cannot_pass(populated):
+    run = RecordedRun(populated, EXPOSURE_REQUEST)
+    result = run.call("calculate_arr_exposure", {})
+    claims = [{"kind": "arr", "calculation_call_id": result["call_id"], "scope": "component", "part_id": g["part_id"],
+               "amount": g["arr"], "account_ids": g["account_ids"], "currency": result["currency"]}
+              for g in sorted(result["groups"], key=lambda g: -int(g["arr"]))]
+    report = run.verify(claims, "direct_component")
+    assert report["report_validation"] == "blocked"
+    assert "required_table_missing" in codes(report)
+    assert report["report"]["formal_report"] is None
+
+
+def test_complete_exposure_table_is_deterministic_and_source_checked(populated, bundle):
+    run = RecordedRun(populated, EXPOSURE_REQUEST)
+    result = run.call("calculate_arr_exposure", {})
+    report = run.verify([table("arr_exposure", result)], "direct_component")
+    assert report["report_validation"] == "passed"
+    rows = report["report"]["tables"][0]["rows"]
+    assert len(rows) == len(result["groups"])
+    assert [r["arr"] for r in rows] == sorted((r["arr"] for r in rows), key=int, reverse=True)
+    tickets = json.loads(bundle.files["crm_json_data/tickets.json"])
+    for row in rows:
+        assert row["part_name"]
+        assert row["ticket_count"] == len({t["ticket_id"] for t in tickets if t["status"] == "open" and t["priority"] in ("p0", "p1") and row["part_id"] in t["components"]})
+    assert "开放工单数量" in report["report"]["formal_report"]
+    # A correct amount cannot legitimize a tampered derived name or count.
+    stored = json.loads(run.state["messages"][-1]["content"])
+    stored["groups"][0]["ticket_count"] += 1
+    run.state["messages"][-1]["content"] = json.dumps(stored)
+    assert run.verify([table("arr_exposure", result)], "direct_component")["report_validation"] == "blocked"
+
+
+def test_ticket_table_requires_all_pages_and_all_requested_rows(populated):
+    run = RecordedRun(populated, TICKET_REQUEST)
+    pages = [run.call("list_ticket_contexts", {"priorities": ["p1"], "limit": 10})]
+    assert run.verify([table("ticket_contexts", *pages)])["report_validation"] == "blocked"
+    while pages[-1]["next_offset"] is not None:
+        pages.append(run.call("list_ticket_contexts", {"priorities": ["p1"], "limit": 10, "offset": pages[-1]["next_offset"]}))
+    report = run.verify([table("ticket_contexts", *pages)])
+    assert report["report_validation"] == "passed"
+    assert len(report["report"]["tables"][0]["rows"]) == pages[0]["total_matches"]
+    assert len(report["report"]["verified_claims"]) > 60  # Expanded deterministically, not generated by the LLM.
+    assert run.verify([table("ticket_contexts", pages[0])])["report_validation"] == "blocked"
+
+
+def test_table_and_repeated_atomic_claims_publish_one_canonical_collection(populated):
+    run = RecordedRun(populated, EXPOSURE_REQUEST)
+    result = run.call("calculate_arr_exposure", {})
+    group = result["groups"][0]
+    duplicate = {"kind": "arr", "calculation_call_id": result["call_id"], "scope": "component", "part_id": group["part_id"],
+                 "amount": group["arr"]+".0", "account_ids": list(reversed(group["account_ids"])), "currency": result["currency"]}
+    report = run.verify([duplicate, table("arr_exposure", result), table("arr_exposure", result)], "direct_component")
+    assert report["report_validation"] == "passed"
+    arr = [c["claim"] for c in report["report"]["verified_claims"] if c["claim"]["kind"] == "arr"]
+    assert len(arr) == len(result["groups"])
+    assert [float(c["amount"]) for c in arr] == sorted((float(c["amount"]) for c in arr), reverse=True)
+    assert len(report["report"]["tables"]) == 1
+
+
+def test_collection_report_cannot_narrow_global_request_or_change_customer(populated):
+    run = RecordedRun(populated, TICKET_REQUEST)
+    result = run.call("list_ticket_contexts", {"priorities": ["p1"], "account_id": "ACC-013"})
+    assert "unsupported_claims" in codes(run.verify([table("ticket_contexts", result)]))
+    run = RecordedRun(populated, TICKET_REQUEST)
+    result = run.call("list_ticket_contexts", {"priorities": ["p1"]})
+    stored = json.loads(run.state["messages"][-1]["content"])
+    stored["items"][0]["data"]["account_name"] = "Different customer"
+    run.state["messages"][-1]["content"] = json.dumps(stored)
+    assert run.verify([table("ticket_contexts", result)])["report_validation"] == "blocked"
+    run = RecordedRun(populated, TICKET_REQUEST + "同时列出全部相关工程问题。")
+    result = run.call("list_ticket_contexts", {"priorities": ["p1"]})
+    report = run.verify([table("ticket_contexts", result)])
+    assert any(c["code"] == "issue_enumeration_not_complete" for c in report["report"]["rejected_claims"])
+
+
+def test_batch_context_preserves_multiple_components_and_proves_absence(conn, tmp_path):
+    from test_dataset import make_archive
+    from enterpriseiq.dataset import read_bundle
+    from enterpriseiq.store import import_bundle
+
+    path, sha = make_archive(tmp_path, {
+        "crm_json_data/accounts.json": [{"account_id": "A", "account_name": "Example", "arr": 123}],
+        "crm_json_data/tickets.json": [{"ticket_id": "T", "account_id": "A", "subject": "Two components", "status": "open", "priority": "p2", "components": ["P1", "P2"]}],
+        "pm_json_data/maple_parts.json": [{"part_id": "P1", "title": "First"}, {"part_id": "P2", "title": "Second"}],
+        "pm_json_data/issues.json": [{"issue_id": "I", "status": "in_progress", "priority": "low", "components": ["P2"]}],
+    })
+    import_bundle(conn, read_bundle(path, expected_sha256=sha), snapshot_id="test-context-snapshot")
+    result = BusinessTools(conn, "test-context-snapshot").execute("list_ticket_contexts", {"priorities": ["p2"]})
+    assert result["complete"] is True
+    components = result["items"][0]["data"]["components"]
+    assert [(c["open_issue_count"], c["representative_issue_id"]) for c in components] == [(0, None), (1, "I")]
+    assert all(c["existence_and_count_complete"] and c["enumeration_complete"] for c in components)
