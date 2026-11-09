@@ -67,6 +67,30 @@ it("reload restores a waiting investigation and its clarification form", async (
   expect(screen.getByRole("button", { name: "补充并继续 ↗" })).toBeDefined();
 });
 
+it("explains incompatible restore and offers a new follow-up instead of retrying it", async () => {
+  location.hash = "#case-1";
+  responses({
+    ...detail,
+    jobs: [
+      {
+        ...job,
+        status: "failed",
+        error_code: "checkpoint_engine_incompatible",
+      },
+    ],
+  });
+  render(<App />);
+  expect(
+    await screen.findByText(
+      "执行版本不兼容，已停止恢复。旧记录保留，请发起新的后续调查。",
+    ),
+  ).toBeDefined();
+  expect(
+    screen.getByRole("button", { name: "后续调查 ↗" }).hasAttribute("disabled"),
+  ).toBe(false);
+  expect(screen.queryByRole("button", { name: "恢复调查 ↗" })).toBeNull();
+});
+
 it("does not offer self-review to an investigator who also has reviewer role", async () => {
   location.hash = "#case-1";
   const completed = {

@@ -197,3 +197,25 @@ npm --prefix web run build
 ```
 
 新增 worker 集成测试使用由测试身份创建的独立 `enterpriseiq_m3_test_<uuid>` 数据库，结束后只删除该数据库；需本地测试角色具备建库权限，绝不删除开发库。自动测试只替换外部模型，实际工具、原始来源校验、Case 及 PostgreSQL checkpoint 均参与验证。运行证据与浏览器截图保存在忽略的 `outputs/`，阶段实测结果见 `docs/PROJECT_STATUS.md`。
+
+
+## M3 分级评测与版本恢复（交付项 3）
+
+普通小修先做受影响的确定性测试；调查/报告行为变化再用已有失败 Trace 离线复验；必要时才运行少量真实冒烟；21 次冻结验收保留到阶段冻结或重大行为变化。本项不执行真实模型调用。无付费入口：
+
+```powershell
+# 现有历史批次全部读取；不执行 Agent，不恢复 checkpoint，不改写原始评分/Trace
+uv run --locked --env-file .env python scripts/evaluate_m3.py
+# 三类新增业务场景、离线评测保护与恢复故障注入；仅外部模型使用替代物
+uv run --locked --env-file .env pytest tests/test_m3_evaluation.py tests/test_m3_scenarios.py tests/test_m3_recovery.py -q --tb=short
+```
+
+离线命令仅通过只读数据库事务执行当前 ReportVerifier，并调用原封不动的 M1/M2 冻结评分函数；两份评分脚本以既有 SHA-256 固定，变更即拒绝评测。每次写入新的忽略目录 `outputs/m3-offline-<time>-<id>/replay.json`，保留原始评分行、输入哈希、当前校验缺口、当前自动评分及历史复核文件引用。缺 Trace、无效 JSON、身份不一致、重复 run、截断结果或未知场景均明确列出，不从分母删除。不同开发版本的历史批次不能合并成生产成功率；早期 M1 的 results/reviewed_results 也分别保留，不用当前评分覆盖原历史。
+
+三个新增产品场景位于独立评测脚本，不进入 Agent 工具或检索数据：ACC-004 全部开放 P2 工单的实体/优先级/分页/金额范围；客户修复/ETA 证据不足及不可信来源指令；ISS-032 的冲突 ETA 来源。故障测试覆盖漏页、错误客户、篡改金额、工具超时、缺失正文、虚构完成状态和冲突来源遗漏。注入文档只存在于测试事务或独立测试库，不污染开发快照。新场景有单独的确定性产品检查轨道：正确保留证据缺口或冲突可以通过预设的拒答检查，不能把所有 blocked 当通过；来源/报告校验、自动业务检查和复核始终分开。
+
+恢复采用精确匹配：保存状态（包括已登记、尚无 checkpoint 的队列输入）的 engine_version 和 snapshot_id 必须等于当前值，task_contract 必须含正确类型的版本并与当前问题重新推导的契约一致。当前为 `m2-enhancement-2`、固定合成快照和任务契约 v1；本项未改图状态结构或图拓扑，因此未伪造一个新的可迁移版本。任何未来不兼容的状态/工具/报告协议变更必须更新引擎版本并另行验证，不能继续沿用相同版本号。
+
+同版本持久化状态可以在新进程继续，累计模型/工具计数、证据和剩余预算保留；已完成 run 重复恢复不重新执行工具。旧版本、缺版本、未来契约或快照不匹配在模型/工具调用和状态写入前拒绝。worker 分别报告 `checkpoint_engine_incompatible` / `checkpoint_snapshot_incompatible` / `checkpoint_contract_incompatible`，保持旧 checkpoint 和业务历史，不再冒充可重试的 interrupted；需要执行时明确创建后续 run。离线原文复验可以读取旧 Trace，但不使旧 checkpoint 可恢复，也不把它升级为当前正式报告。
+
+确定性故障测试只证明约束与校验门槛；未证明真实模型在新业务问题或来源指令下的表现。Codex 的代码/来源复核不称为独立真人审核。未来发生真实调用前仍须检查统一预算及剩余额度；旧 CLI/评测入口统一预算接入属于交付项 4，不能借本离线命令绕过预算启动付费评测。

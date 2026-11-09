@@ -6,7 +6,7 @@ import time
 
 import psycopg
 
-from enterpriseiq.agent import build_agent, execute_run, postgres_checkpointer, save_result
+from enterpriseiq.agent import CheckpointCompatibilityError, build_agent, execute_run, postgres_checkpointer, save_result
 from enterpriseiq.cases import Cases
 from enterpriseiq.jobs import Jobs, WORKER_LOCK
 from enterpriseiq.model import ModelError
@@ -44,6 +44,12 @@ def process_job(conn, saver, job, *, model=None):
         conn.execute("UPDATE investigation_web.jobs SET status=%s,error_code=%s,updated_at=now() WHERE job_id=%s", (status, error, job_id))
         conn.commit()
         return result
+    except CheckpointCompatibilityError as exc:
+        conn.rollback()
+        conn.execute("UPDATE investigation_web.jobs SET status='failed',error_code=%s,updated_at=now() WHERE job_id=%s", (exc.code, job_id))
+        conn.commit()
+        # Existing checkpoint and Case history stay untouched. Start a new run explicitly.
+        return None
     except Exception:
         # Do not export raw exception text, credentials, HTTP bodies or source contents.
         conn.rollback()

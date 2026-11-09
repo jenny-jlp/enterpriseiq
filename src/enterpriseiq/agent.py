@@ -340,6 +340,29 @@ def _database_run_lock(graph, run_id):
         yield
 
 
+class CheckpointCompatibilityError(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__({
+            "checkpoint_engine_incompatible": "Checkpoint engine version is incompatible",
+            "checkpoint_snapshot_incompatible": "Checkpoint data snapshot is incompatible",
+            "checkpoint_contract_incompatible": "Checkpoint task contract version is incompatible",
+        }[code])
+
+
+def require_compatible_state(state):
+    # Exact-match restore only; no implicit migration of saved or queued execution state.
+    if state.get("engine_version") != ENGINE_VERSION:
+        raise CheckpointCompatibilityError("checkpoint_engine_incompatible")
+    if state.get("snapshot_id") != SNAPSHOT_ID:
+        raise CheckpointCompatibilityError("checkpoint_snapshot_incompatible")
+    contract = state.get("task_contract")
+    if (not isinstance(contract, dict) or type(contract.get("version")) is not int
+            or not isinstance(state.get("question"), str)
+            or contract != task_contract(state["question"])):
+        raise CheckpointCompatibilityError("checkpoint_contract_incompatible")
+
+
 def execute_run(graph, *, state=None, run_id=None, clarification=None, on_result=None):
     run_id = state["run_id"] if state else run_id
     with run_lock(graph, run_id):
@@ -355,13 +378,12 @@ def _execute_run(graph, *, state=None, run_id=None, clarification=None):
     saved = graph.get_state(config)
     if state is not None and saved.values:
         raise ValueError("Run already exists; use resume")
+    if state is not None:
+        require_compatible_state(state)
     if state is None:
         if not saved.values:
             raise ValueError("Run not found")
-        if saved.values.get("engine_version") != ENGINE_VERSION:
-            raise ValueError("Checkpoint engine version is incompatible")
-        if saved.values.get("snapshot_id") != SNAPSHOT_ID:
-            raise ValueError("Checkpoint data snapshot is incompatible")
+        require_compatible_state(saved.values)
         if clarification is not None:
             if saved.values.get("stop_reason") != "clarification_required" or not clarification.strip():
                 raise ValueError("This run does not accept clarification")

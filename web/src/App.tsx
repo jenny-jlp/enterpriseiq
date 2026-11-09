@@ -698,7 +698,17 @@ export default function App() {
                     <p>
                       {latestJob.error_code === "model_calls_disabled"
                         ? "当前运行未启用模型服务。请联系本地管理员；已保留失败记录，可在同一 Case 发起后续调查。"
-                        : `原因：${latestJob.error_code ?? "请检查执行记录"}。已有证据与缺口继续保留。`}
+                        : ((
+                            {
+                              checkpoint_engine_incompatible:
+                                "执行版本不兼容，已停止恢复。旧记录保留，请发起新的后续调查。",
+                              checkpoint_snapshot_incompatible:
+                                "数据快照不兼容，已停止恢复。旧记录保留，请发起新的后续调查。",
+                              checkpoint_contract_incompatible:
+                                "任务契约不兼容，已停止恢复。旧记录保留，请发起新的后续调查。",
+                            } as Record<string, string>
+                          )[latestJob.error_code ?? ""] ??
+                          `原因：${latestJob.error_code ?? "请检查执行记录"}。已有证据与缺口继续保留。`)}
                     </p>
                   </div>
                 )}
