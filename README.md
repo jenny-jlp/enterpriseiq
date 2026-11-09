@@ -150,3 +150,48 @@ M2 的推进条件/行动调查另检查已读通话中显式编号的 `ACTION I
 
 
 M2 当前验证：63 项测试通过；最终 15 次调查报告校验 15/15，冻结自动业务评分 13/15（M1 子集 8/9、新增 5/6），两处 clear/clean 原文措辞误拒单列。Codex 原文复核 15/15（不是独立真人审核），用户已原则认可交付和两项语义复核依据；七批 105 次及失败全部保留。完整记录见 `docs/PROJECT_STATUS.md`。
+
+
+## M3 本地调查工作台（交付项 1）
+
+沿用现有引擎/工具/校验器/Case，只新增薄 API、React 界面和 PostgreSQL 单 worker 作业登记。浏览器提交后立即取得 job/run/Case ID；worker 独立执行，页面刷新或连接关闭不取消调查。请求 ID 与内容绑定，网络不确定时使用“重试原提交”，不重新发起调查。旧 CLI Case 不自动暴露到 Web。
+
+```powershell
+uv sync --locked
+npm --prefix web ci
+npm --prefix web run build
+# 仅首次创建本地演示身份；用户及会话凭据都不得提交
+uv run enterpriseiq-web-user investigator --roles investigator
+uv run enterpriseiq-web-user reviewer --roles reviewer
+uv run enterpriseiq-web-user viewer --roles viewer
+# 终端一：界面和 API；访问 http://127.0.0.1:8000
+uv run --env-file .env uvicorn enterpriseiq.web:app --factory --host 127.0.0.1 --port 8000
+# 终端二：独立 worker；默认 smoke，累计受 M3 预算约束
+uv run --env-file .env enterpriseiq-worker --live
+# 不加 --live 不访问供应方：需模型的任务明确失败；澄清仍可零模型执行
+```
+
+登录令牌保存在忽略的 `.secrets/<user_id>.login.txt`，服务端配置只保存 SHA-256；浏览器以 8 小时 HttpOnly/SameSite=Strict 会话登录，不将令牌存入 localStorage。移除身份/修改角色后重启 API 生效。本地 HTTP 只绑定回环地址；HTTPS 部署需 `ENTERPRISEIQ_COOKIE_SECURE=1`，部署与 SSO 不在本项范围。Vite 开发代理默认用 8000 后端；开发时将 `.env` 的 `ENTERPRISEIQ_ORIGIN` 设为 Vite 实际显示的源地址，并重启 API。
+
+| 后端操作 | viewer | investigator | reviewer |
+|---|---|---|---|
+| 查看所属工作空间的 Case/版本/工具记录/原始证据 | 允许 | 允许 | 允许 |
+| 创建调查、同 Case 后续调查 | 拒绝 | 允许 | 拒绝 |
+| 澄清/恢复 | 拒绝 | 仅自己发起的最新 run | 拒绝 |
+| 修改再校验/接受/驳回 | 拒绝 | 拒绝 | 仅他人发起的调查 |
+
+身份可兼任多个角色，但不能审核自己发起调查产生的任何报告版本。reviewer 对他人报告修改后再接受，是同一审核流程，不冒充第二次独立审核。所有检查在服务端执行，审核人来自会话；任意资源 ID 不能越过工作空间范围。当前只有本地预置身份和共享合成数据域，不宣称多租户数据层隔离或上游 ACL 已实现。CLI 持有数据库凭据，是受信本地管理入口，不通过 HTTP 暴露。
+
+`jobs.py/web.sql` 保存登记、幂等和作业状态；`worker.py` 复用执行锁、checkpoint 与 Case 投影。单 worker 使用独立 PostgreSQL 会话锁；异常退出后显示 interrupted，由发起人明确恢复，不自动无限重试。首个 checkpoint 前崩溃可使用原始登记状态重启同一 run；已有 checkpoint 继续采用 M2 恢复与截止时间规则。页面轮询已保存的调用/token/工具行为，不展示隐藏思维链。接受报告不触发外部系统写入。
+
+为交付项 1 的真实冒烟先接入最小预算门槛 `budget.py/budget.sql`：累计 30 个真实调查、180 次请求、120 万 token、估算 CNY 30；smoke 最多 9 个 run、freeze 最多 21 个，任一上限先到即停。预留和结算由独立 PostgreSQL 连接提交，失败/重试/恢复不清零；未知请求保留最大预留，超预留观测会阻止后续调用。输入按请求 UTF-8 字节加 framing 余量保守预留，输出预留既有 4096 token 上限；实际用量可用后结算。费率按 2026-11-09 核验的官方 `deepseek-flash` 高峰/缓存未命中价格估算（输入 2、输出 8 元/百万 token），不是实付账单；其他模型未定价时拒绝调用。价格或预算变更不得静默重置现有账本。
+
+预算门槛当前用于 Web worker；交付项 4 仍需补充 CLI/评测入口统一接入与成本性能报告。M3 的付费运行目前仅通过受预算保护的 worker 执行，不使用旧 CLI 绕过门槛。21 次冻结评测未在本项启动。
+
+```powershell
+uv run --locked --env-file .env pytest -q --tb=short
+npm --prefix web test
+npm --prefix web run build
+```
+
+新增 worker 集成测试使用由测试身份创建的独立 `enterpriseiq_m3_test_<uuid>` 数据库，结束后只删除该数据库；需本地测试角色具备建库权限，绝不删除开发库。自动测试只替换外部模型，实际工具、原始来源校验、Case 及 PostgreSQL checkpoint 均参与验证。运行证据与浏览器截图保存在忽略的 `outputs/`，阶段实测结果见 `docs/PROJECT_STATUS.md`。
