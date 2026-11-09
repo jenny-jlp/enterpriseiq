@@ -20,6 +20,7 @@ build-backend = "hatchling.build"
 enterpriseiq = "enterpriseiq.cli:main"
 enterpriseiq-worker = "enterpriseiq.worker:main"
 enterpriseiq-web-user = "enterpriseiq.web_auth:main"
+enterpriseiq-maintain = "enterpriseiq.lifecycle:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/enterpriseiq"]

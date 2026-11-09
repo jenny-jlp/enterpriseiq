@@ -196,6 +196,21 @@ uv run --env-file .env enterpriseiq-worker --live
 
 `uv run --locked --env-file .env python scripts/paid_eval.py --suite m1` 默认仅检查/初始化预算，不执行调查，`--live` 才会执行保留原评分口径的旧批次（m1 9 次/m2 15 次）；预算错误立即停止并保留调用记录。直接执行旧脚本也受 CLI/适配器预算门槛约束。此入口不代表 M3 的 21 次冻结已运行；离线评测仍使用 `scripts/evaluate_m3.py`，交付项 4 未调用真实模型。
 
+M3 最小保留规则由 `lifecycle.py/lifecycle.sql` 实施，不自动后台清理：
+
+| 对象 | 保留与清理边界 |
+|---|---|
+| Trace | Case 中的原始执行状态保留；仅删除满 30 天、与 Case 归档完全相同的 UUID 命名本地副本。未登记、不同内容、非法路径和冻结验收引用的文件不删 |
+| Checkpoint | 满 30 天的终态、无待执行节点、与 Case 完整投影一致且无待恢复作业，才删除该 run 的 checkpoint/blobs/writes；冻结验收引用的 run 保留 |
+| Case / 报告 / 审核 | 无限期保留；不提供 Case 删除或压缩原始状态功能，原不可变历史约束保持 |
+| 数据快照 | 审计基线及 Case/报告/Trace 引用的快照保留；其他快照满 90 天且无引用才按依赖顺序删除。存在未知 checkpoint 或不可解析 Trace 时保守阻止快照清理 |
+
+维护入口为 `uv run --locked --env-file .env enterpriseiq-maintain --reason "本次维护原因"`；默认 dry-run，仅写维护审计。明确加 `--apply` 才删除符合规则的副本。必须单独配置 `MAINTENANCE_DATABASE_URL`；没有应用凭据回退，不提供 Web 维护路由，viewer/investigator/reviewer 无维护授权。数据库管理员或明确加入 `enterpriseiq_maintenance` 数据库角色且获得所需表权限的受信维护用户才能运行；该角色由管理员单独创建/授权，程序不会自动授予权限。当前本地数据库所有者是受信管理员；此边界不防范数据库超级用户。
+
+先停止 worker；维护锁与逐 run 执行锁保护清理，运行中的 CLI、暂停、澄清、近期和未投影状态均保留。操作记录实际数据库身份、会话身份、原因、策略、候选与保护原因；删除前记录逐项 intent，完成后才标记 completed。失败保留 failed/intents，不假装文件系统与数据库可以原子提交；需检查审计后再重试。审计、预算账本和 Checkpoint 退役记录不清理，已完成审计禁止覆盖/删除。清理后恢复返回 `checkpoint_retired`，仍可查看 Case、报告、审核、归档 Trace 和原证据。
+
+接入契约验证复用既有 `read_bundle/import_bundle/BusinessTools`，新增/更新/删除/关系变化生成独立测试快照，旧快照与引用不覆盖；缺来源、错误哈希、重复 ID、非法路径、悬空关系均拒绝。来源后来损坏时证据读取返回明确 409，不改写原审核历史。测试只在独立数据库使用变更夹具；没有真实 CRM/Jira 接入、增量同步调度或跨快照 Agent 调查能力，当前生产引擎仍只接受冻结审计快照。
+
 ```powershell
 uv run --locked --env-file .env pytest -q --tb=short
 npm --prefix web test

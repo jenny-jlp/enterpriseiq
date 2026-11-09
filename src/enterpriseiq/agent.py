@@ -348,6 +348,7 @@ class CheckpointCompatibilityError(ValueError):
             "checkpoint_engine_incompatible": "Checkpoint engine version is incompatible",
             "checkpoint_snapshot_incompatible": "Checkpoint data snapshot is incompatible",
             "checkpoint_contract_incompatible": "Checkpoint task contract version is incompatible",
+            "checkpoint_retired": "checkpoint_retired: execution state expired; Case, reports and evidence are retained",
         }[code])
 
 
@@ -377,6 +378,13 @@ def _execute_run(graph, *, state=None, run_id=None, clarification=None):
     run_id = state["run_id"] if state else run_id
     config = {"configurable": {"thread_id": run_id}, "recursion_limit": 250}
     saved = graph.get_state(config)
+    if not saved.values:
+        conn = getattr(graph.checkpointer, 'conn', None)
+        if conn is not None:
+            row = conn.execute("SELECT to_regclass('investigation_maintenance.retired_checkpoints') IS NOT NULL AS present").fetchone()
+            present = row['present'] if isinstance(row, dict) else row[0]
+            if present and conn.execute('SELECT 1 FROM investigation_maintenance.retired_checkpoints WHERE run_id=%s', (run_id,)).fetchone():
+                raise CheckpointCompatibilityError('checkpoint_retired')
     if state is not None and saved.values:
         raise ValueError("Run already exists; use resume")
     if state is not None:
