@@ -171,7 +171,7 @@ uv run --env-file .env enterpriseiq-worker --live
 # 不加 --live 不访问供应方：需模型的任务明确失败；澄清仍可零模型执行
 ```
 
-登录令牌保存在忽略的 `.secrets/<user_id>.login.txt`，服务端配置只保存 SHA-256；浏览器以 8 小时 HttpOnly/SameSite=Strict 会话登录，不将令牌存入 localStorage。移除身份/修改角色后重启 API 生效。本地 HTTP 只绑定回环地址；HTTPS 部署需 `ENTERPRISEIQ_COOKIE_SECURE=1`，部署与 SSO 不在本项范围。Vite 开发代理默认用 8000 后端；开发时将 `.env` 的 `ENTERPRISEIQ_ORIGIN` 设为 Vite 实际显示的源地址，并重启 API。
+登录令牌位置以 provision 命令输出为准；新建文件位于忽略的 `.secrets/<workspace_hash>/<user_id>.login.txt`，不同工作空间的同名身份不会覆盖令牌。交付项 1 已生成的旧路径令牌继续有效，不自动搬移。服务端配置只保存 SHA-256；浏览器以 8 小时 HttpOnly/SameSite=Strict 会话登录，不将令牌存入 localStorage。移除身份、修改角色或身份/工作空间绑定后重启 API 生效；旧会话不能继承新权限，需重新登录。首次升级会话绑定字段后，旧的未绑定会话也须重新登录，Case/报告/证据不变。本地 HTTP 只绑定回环地址；HTTPS 部署需 `ENTERPRISEIQ_COOKIE_SECURE=1`，部署与 SSO 不在本项范围。Vite 开发代理默认用 8000 后端；开发时将 `.env` 的 `ENTERPRISEIQ_ORIGIN` 设为 Vite 实际显示的源地址，并重启 API。
 
 | 后端操作 | viewer | investigator | reviewer |
 |---|---|---|---|
@@ -180,7 +180,9 @@ uv run --env-file .env enterpriseiq-worker --live
 | 澄清/恢复 | 拒绝 | 仅自己发起的最新 run | 拒绝 |
 | 修改再校验/接受/驳回 | 拒绝 | 拒绝 | 仅他人发起的调查 |
 
-身份可兼任多个角色，但不能审核自己发起调查产生的任何报告版本。reviewer 对他人报告修改后再接受，是同一审核流程，不冒充第二次独立审核。所有检查在服务端执行，审核人来自会话；任意资源 ID 不能越过工作空间范围。当前只有本地预置身份和共享合成数据域，不宣称多租户数据层隔离或上游 ACL 已实现。CLI 持有数据库凭据，是受信本地管理入口，不通过 HTTP 暴露。
+同一工作空间的不同身份可以查看共享 Case；资源读取按工作空间授权，不提供按个人隐藏 Case 的规则。恢复权限另外绑定具体 run 的发起人；拒绝冒用别人的请求 ID，拒绝通过伪造 ID 读取或接管未映射的 CLI Case。只读 GET 仅显示作业中断状态，不更新其他用户或工作空间的数据；持久化恢复仅由发起人授权的 resume 或受信 worker 执行。
+
+身份可兼任多个角色，但不能审核自己发起调查产生的任何报告版本。reviewer 对他人报告修改后再接受，是同一审核流程，不冒充第二次独立审核。所有检查在服务端执行，审核人来自会话；任意资源 ID 不能越过工作空间范围。当前只有本地预置身份和共享合成数据域，不宣称多租户数据层隔离或上游 ACL 已实现。CLI 持有数据库凭据，是受信本地管理入口，不通过 HTTP 暴露。 CLI 追加到 Web Case 的 run 如果没有可信发起人映射，HTTP 审核会拒绝，不能沿用较早 run 的发起人判断职责隔离。
 
 `jobs.py/web.sql` 保存登记、幂等和作业状态；`worker.py` 复用执行锁、checkpoint 与 Case 投影。单 worker 使用独立 PostgreSQL 会话锁；异常退出后显示 interrupted，由发起人明确恢复，不自动无限重试。首个 checkpoint 前崩溃可使用原始登记状态重启同一 run；已有 checkpoint 继续采用 M2 恢复与截止时间规则。页面轮询已保存的调用/token/工具行为，不展示隐藏思维链。接受报告不触发外部系统写入。
 

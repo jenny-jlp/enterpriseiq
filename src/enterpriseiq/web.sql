@@ -28,5 +28,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_active_web_job ON investigation_web.jobs(r
 CREATE TABLE IF NOT EXISTS investigation_web.sessions (
     token_hash text PRIMARY KEY,
     credential_hash text NOT NULL,
+    identity_binding text,
     expires_at timestamptz NOT NULL DEFAULT now() + interval '8 hours'
 );
+ALTER TABLE investigation_web.sessions ADD COLUMN IF NOT EXISTS identity_binding text;

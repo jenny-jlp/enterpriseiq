@@ -40,7 +40,7 @@ type Run = {
   run_id: string;
   question: string;
   execution_status: string;
-  initiator: string;
+  initiator: string | null;
   evidence: Record<string, Ref>;
   trace: Record<string, Trace>;
   gaps: unknown[];
@@ -285,6 +285,7 @@ export default function App() {
   const ownReport = latestRun?.initiator === user?.user_id;
   const canReview = Boolean(
     user?.roles.includes("reviewer") &&
+    latestRun?.initiator &&
     !ownReport &&
     !pending &&
     report &&
@@ -663,7 +664,7 @@ export default function App() {
                       }
                     />
                     <Badge status={detail.business_status} />
-                    <span>发起人 {latestRun?.initiator}</span>
+                    <span>发起人 {latestRun?.initiator ?? "未登记"}</span>
                   </div>
                 </div>
                 <button
@@ -847,6 +848,12 @@ export default function App() {
                             你是该调查的发起人，不能审核其报告。请由另一位审核员处理。
                           </p>
                         )}
+                        {!latestRun?.initiator &&
+                          user.roles.includes("reviewer") && (
+                            <p className="review-boundary">
+                              当前调查未登记可信发起人，不能通过工作台审核。
+                            </p>
+                          )}
                         {canReview && (
                           <section className="review-form">
                             <div className="section-title">

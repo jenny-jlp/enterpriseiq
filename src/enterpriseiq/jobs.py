@@ -73,7 +73,7 @@ class Jobs:
             if owner != identity.user_id:
                 raise HTTPException(403, "Only the investigator who started this run may resume it")
             Cases(self.conn)._lock(case_id)
-            self.recover_interrupted()
+            self.recover_interrupted(run_id=run_id)
             newest_run = self.conn.execute("SELECT run_id FROM investigation_cases.runs WHERE case_id=%s ORDER BY run_order DESC LIMIT 1", (case_id,)).fetchone()
             if str(newest_run[0]) != str(run_id):
                 raise HTTPException(409, "A newer investigation exists in this Case")
@@ -86,27 +86,39 @@ class Jobs:
                 VALUES (%s,%s,%s,%s,%s,%s,'resume',%s)""", (request_id, identity.workspace, identity.user_id, fingerprint, case_id, run_id, Jsonb({"clarification": clarification})))
             return self.get(identity, request_id)
 
-    def recover_interrupted(self):
+    def worker_running(self):
         # A session lock is held for the worker's entire lifetime. No timer guesses.
         acquired = self.conn.execute("SELECT pg_try_advisory_lock(%s)", (WORKER_LOCK,)).fetchone()[0]
         if acquired:
-            try:
-                self.conn.execute("UPDATE investigation_web.jobs SET status='interrupted',error_code='worker_interrupted',updated_at=now() WHERE status='running'")
-            finally:
-                self.conn.execute("SELECT pg_advisory_unlock(%s)", (WORKER_LOCK,))
+            self.conn.execute("SELECT pg_advisory_unlock(%s)", (WORKER_LOCK,))
+        return not acquired
+
+    def recover_interrupted(self, *, run_id=None):
+        # Only the trusted worker sweeps all jobs. HTTP resumes pass an authorized run.
+        if not self.worker_running():
+            self.conn.execute("""UPDATE investigation_web.jobs SET status='interrupted',error_code='worker_interrupted',updated_at=now()
+                WHERE status='running' AND (%s::uuid IS NULL OR run_id=%s)""", (run_id, run_id))
 
     def get(self, identity, job_id):
         row = self.conn.execute("""SELECT job_id,case_id,run_id,status,error_code,created_at,updated_at
             FROM investigation_web.jobs WHERE job_id=%s AND workspace=%s""", (job_id, identity.workspace)).fetchone()
         if not row:
             raise HTTPException(404, "Job not found")
-        return dict(zip(("job_id", "case_id", "run_id", "status", "error_code", "created_at", "updated_at"),
-                        [str(v) if v is not None else None for v in row]))
+        result = dict(zip(("job_id", "case_id", "run_id", "status", "error_code", "created_at", "updated_at"),
+                          [str(v) if v is not None else None for v in row]))
+        if result["status"] == "running" and not self.worker_running():
+            # GET is a read-only projection, including for viewer and unknown-resource reads.
+            result.update(status="interrupted", error_code="worker_interrupted")
+        return result
 
     def list_cases(self, identity):
-        self.recover_interrupted()
-        ids = {str(r[0]) for r in self.conn.execute("SELECT case_id FROM investigation_web.cases WHERE workspace=%s", (identity.workspace,))}
-        cases = [c for c in Cases(self.conn).list_cases() if c["case_id"] in ids]
+        rows = self.conn.execute("""SELECT c.case_id,c.created_at,u.run_id,u.question,u.state
+            FROM investigation_web.cases scope JOIN investigation_cases.cases c USING(case_id)
+            LEFT JOIN LATERAL (SELECT run_id,question,state FROM investigation_cases.runs
+                WHERE case_id=c.case_id ORDER BY run_order DESC LIMIT 1) u ON true
+            WHERE scope.workspace=%s ORDER BY c.created_at,c.case_id""", (identity.workspace,)).fetchall()
+        cases = [{"case_id":str(r[0]), "created_at":r[1].isoformat(), "run_id":str(r[2]) if r[2] else None,
+                  "question":r[3], "execution_status":r[4].get("status") if r[4] else "registered"} for r in rows]
         for case in cases:
             case["jobs"] = self.case_jobs(identity, case["case_id"])
         return cases
@@ -120,7 +132,6 @@ class Jobs:
 
     def show_case(self, identity, case_id):
         self.require_case(identity, case_id)
-        self.recover_interrupted()
         result = Cases(self.conn).show(case_id)
         result["jobs"] = self.case_jobs(identity, case_id)
         owners = dict((str(r[0]), r[1]) for r in self.conn.execute("SELECT r.run_id,w.initiator FROM investigation_cases.runs r JOIN investigation_web.runs w USING(run_id) WHERE case_id=%s", (case_id,)))
@@ -173,8 +184,10 @@ class Jobs:
             return Cases(self.conn).review(case_id, body.report_id, body.action, identity.user_id,
                                           body.reason, body.request_id, opinion=body.opinion, draft=body.draft)
         # Check the initiator independently of the client-supplied report ID.
-        row = self.conn.execute("SELECT w.initiator FROM investigation_cases.runs r JOIN investigation_web.runs w USING(run_id) WHERE case_id=%s ORDER BY run_order DESC LIMIT 1", (case_id,)).fetchone()
-        if not row or row[0] == identity.user_id:
+        row = self.conn.execute("SELECT w.initiator FROM investigation_cases.runs r LEFT JOIN investigation_web.runs w USING(run_id) WHERE case_id=%s ORDER BY run_order DESC LIMIT 1", (case_id,)).fetchone()
+        if not row or row[0] is None:
+            raise HTTPException(403, "The latest run has no trusted initiator; HTTP review is not permitted")
+        if row[0] == identity.user_id:
             raise HTTPException(403, "Investigators cannot review their own investigation reports")
         if self.pending_case(case_id):
             raise HTTPException(409, "Investigation is still pending")

@@ -36,7 +36,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function responses(caseData = detail) {
+function responses(caseData: unknown = detail) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (path: string) => {
@@ -86,9 +86,35 @@ it("does not offer self-review to an investigator who also has reviewer role", a
       },
     ],
   };
-  responses(completed as typeof detail);
+  responses(completed);
   render(<App />);
   expect(await screen.findByText(/不能审核其报告/)).toBeDefined();
+  expect(screen.queryByRole("button", { name: "接受报告 ✓" })).toBeNull();
+});
+
+it("explains why a report without a trusted initiator cannot be reviewed", async () => {
+  location.hash = "#case-1";
+  responses({
+    ...detail,
+    runs: [{ ...detail.runs[0], initiator: null }],
+    jobs: [{ ...job, status: "completed" }],
+    reports: [
+      {
+        report_id: "report-1",
+        run_id: "run-1",
+        version: 1,
+        payload: {
+          report_validation: "passed",
+          draft: "{}",
+          report: { formal_report: "历史报告" },
+        },
+      },
+    ],
+  });
+  render(<App />);
+  expect(
+    await screen.findByText("当前调查未登记可信发起人，不能通过工作台审核。"),
+  ).toBeDefined();
   expect(screen.queryByRole("button", { name: "接受报告 ✓" })).toBeNull();
 });
 
@@ -140,7 +166,7 @@ it("renders verified tabular amounts as accessible rows", async () => {
       },
     ],
   };
-  responses(completed as typeof detail);
+  responses(completed);
   render(<App />);
   expect(
     await screen.findByRole("columnheader", { name: "ARR" }),
@@ -168,13 +194,11 @@ it("keeps the workbench usable when a blocked draft is valid JSON with no claims
       },
     ],
   };
-  responses(blocked as typeof detail);
+  responses(blocked);
   render(<App />);
   await userEvent
     .setup()
-    .click(
-      await screen.findByRole("button", { name: "修改报告" }),
-    );
+    .click(await screen.findByRole("button", { name: "修改报告" }));
   expect(await screen.findByRole("alert")).toBeDefined();
   expect(screen.getByRole("heading", { name: /^调查工作台/ })).toBeDefined();
 });

@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import psycopg
 
 from enterpriseiq.jobs import Jobs
-from enterpriseiq.web_auth import Identity, load_users, token_hash
+from enterpriseiq.web_auth import Identity, identity_binding, load_users, token_hash
 
 
 class Body(BaseModel):
@@ -95,9 +95,9 @@ def create_app(*, connect=None, users=None, static_directory=None):
 
     def identity(request: Request, conn=Depends(connection)):
         credential = request.cookies.get("enterpriseiq_session")
-        row = conn.execute("SELECT credential_hash FROM investigation_web.sessions WHERE token_hash=%s AND expires_at>now()", (token_hash(credential or ""),)).fetchone()
+        row = conn.execute("SELECT credential_hash,identity_binding FROM investigation_web.sessions WHERE token_hash=%s AND expires_at>now()", (token_hash(credential or ""),)).fetchone()
         user = users.get(row[0]) if row else None
-        if not user:
+        if not user or row[1] != identity_binding(user):
             raise HTTPException(401, "Sign in to the workbench")
         return user
 
@@ -115,7 +115,7 @@ def create_app(*, connect=None, users=None, static_directory=None):
         if not user:
             raise HTTPException(401, "Invalid login token")
         session = secrets.token_urlsafe(32)
-        conn.execute("INSERT INTO investigation_web.sessions(token_hash,credential_hash) VALUES (%s,%s)", (token_hash(session), credential))
+        conn.execute("INSERT INTO investigation_web.sessions(token_hash,credential_hash,identity_binding) VALUES (%s,%s,%s)", (token_hash(session), credential, identity_binding(user)))
         response.set_cookie("enterpriseiq_session", session, httponly=True, samesite="strict", secure=os.environ.get("ENTERPRISEIQ_COOKIE_SECURE", "0") == "1", max_age=28800, path="/")
         return user.public()
 
@@ -144,7 +144,6 @@ def create_app(*, connect=None, users=None, static_directory=None):
     @api.get("/api/jobs/{job_id}")
     def job_show(job_id: UUID, user=Depends(identity), conn=Depends(connection)):
         jobs = Jobs(conn)
-        jobs.recover_interrupted()
         return jobs.get(user, job_id)
 
     @api.post("/api/runs/{run_id}/resume", status_code=202)
