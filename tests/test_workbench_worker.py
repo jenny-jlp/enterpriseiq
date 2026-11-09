@@ -173,4 +173,4 @@ def test_budget_exhaustion_blocks_before_provider_construction(database, monkeyp
 
     monkeypatch.setattr('enterpriseiq.budget.DeepSeekModel', forbidden_provider)
     with pytest.raises(ModelError, match='budget_exhausted'):
-        BudgetedModel(database, str(uuid4())).complete([], [], 1)
+        BudgetedModel(database, str(uuid4())).for_attempt(1).complete([], [], 1)

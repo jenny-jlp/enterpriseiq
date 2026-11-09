@@ -152,7 +152,8 @@ def build_agent(model, tools, checkpointer, *, pause_after_tool=False, verifier=
             if corrections:
                 budget["content"] += "\n\nCURRENT CORRECTION REQUIRED:\n" + corrections[-1]
             request = [state["messages"][0], *[m for m in state["messages"] if m["role"] != "system"], budget]
-            reply = model.complete(request, tool_definitions(), timeout=max(0.01, min(60, state["deadline"]-time.time())))
+            invocation = model.for_attempt(number) if hasattr(model, 'for_attempt') else model
+            reply = invocation.complete(request, tool_definitions(), timeout=max(0.01, min(60, state["deadline"]-time.time())))
         except ModelError as exc:
             failures = state.get("consecutive_model_failures", 0) + 1
             retry = (exc.code in {"model_http_429", "model_http_500", "model_http_502", "model_http_503", "model_http_504", "model_timeout", "model_connection_error"}

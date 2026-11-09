@@ -188,7 +188,13 @@ uv run --env-file .env enterpriseiq-worker --live
 
 为交付项 1 的真实冒烟先接入最小预算门槛 `budget.py/budget.sql`：累计 30 个真实调查、180 次请求、120 万 token、估算 CNY 30；smoke 最多 9 个 run、freeze 最多 21 个，任一上限先到即停。预留和结算由独立 PostgreSQL 连接提交，失败/重试/恢复不清零；未知请求保留最大预留，超预留观测会阻止后续调用。输入按请求 UTF-8 字节加 framing 余量保守预留，输出预留既有 4096 token 上限；实际用量可用后结算。费率按 2026-11-09 核验的官方 `deepseek-flash` 高峰/缓存未命中价格估算（输入 2、输出 8 元/百万 token），不是实付账单；其他模型未定价时拒绝调用。价格或预算变更不得静默重置现有账本。
 
-预算门槛当前用于 Web worker；交付项 4 仍需补充 CLI/评测入口统一接入与成本性能报告。M3 的付费运行目前仅通过受预算保护的 worker 执行，不使用旧 CLI 绕过门槛。21 次冻结评测未在本项启动。
+交付项 4 将 Web worker、CLI investigate/resume 和原真实评测的 CLI 子进程接入同一门槛。必须配置 `BUDGET_DATABASE_URL`；所有入口指向同一预算库，即使评测改用另一业务库，也不新建或清零预算。缺配置、账本不可用、策略/模型不匹配均停止请求；原始供应方适配器也拒绝没有一次性预算凭证的 HTTP 调用。本地代码和数据库管理员仍是受信边界。
+
+调查准入即计数（启动失败或未发模型请求也不退调查次数），同一 run 恢复不重复计数且不可切换 smoke/freeze。每个逻辑模型序号持久化预留和内容摘要；已保存响应在跨进程恢复时直接复用，同序号不同内容拒绝。进程在预留后突然退出、超时或用量不明时保留全额预留并拒绝静默重发；后续明确重试使用新的序号并再次计费。确定未发送的配置错误用量为零，但保留调查数/尝试数。结算冲突或观测超过预留会阻断新请求，保留较高费用估算供检查；不自动释放未知额度。
+
+`enterpriseiq budget-status` 查询策略、累计值和剩余额度；`enterpriseiq run-metrics <run_id>` 查询逐次模型费用/用量与执行耗时，限受信本地操作员。`performance.py/performance.sql` 在同一 PostgreSQL 中逐次记录模型适配器、工具、来源校验、执行、排队与端到端墙钟；供应方请求耗时单列，缓存复用的适配器耗时不冒充新 HTTP 耗时。Web 端到端从每次作业提交至结果保存/作业提交结束，CLI 从处理入口至结果文件保存；不包含 CLI Python 启动、浏览器渲染或上次澄清的人为等待。计时与供应方已知 Token 为观测，金额按冻结费率估算，未知 Token 使用预留；崩溃缺失的耗时为 null/incomplete，不补零。旧 Trace 不追补未经观测的细分耗时。
+
+`uv run --locked --env-file .env python scripts/paid_eval.py --suite m1` 默认仅检查/初始化预算，不执行调查，`--live` 才会执行保留原评分口径的旧批次（m1 9 次/m2 15 次）；预算错误立即停止并保留调用记录。直接执行旧脚本也受 CLI/适配器预算门槛约束。此入口不代表 M3 的 21 次冻结已运行；离线评测仍使用 `scripts/evaluate_m3.py`，交付项 4 未调用真实模型。
 
 ```powershell
 uv run --locked --env-file .env pytest -q --tb=short

@@ -18,15 +18,31 @@ class DisabledModel:
         raise ModelError("model_calls_disabled")
 
 
-def process_job(conn, saver, job, *, model=None):
+def process_job(conn, saver, job, *, model=None, metrics_database=None):
     """Run a committed job. Tests inject only the external model, using real tools/verifier."""
     job_id, run_id, command, data = job
     if model is None:
         # Safe local default: only explicit --live selects the durable budget wrapper.
         model = DisabledModel()
-    graph = build_agent(model, BusinessTools(conn), saver)
+    from enterpriseiq.performance import ExecutionMetrics, Timed
+    from enterpriseiq.reliability import ReportVerifier
+    from enterpriseiq.budget import BudgetedModel
+
+    live = isinstance(model, BudgetedModel)
+    metrics_dsn = model.dsn if live else metrics_database
+    if not metrics_dsn:
+        raise ValueError('Explicit metrics database required')
+    submitted = conn.execute('SELECT created_at FROM investigation_web.jobs WHERE job_id=%s', (job_id,)).fetchone()[0]
+    # Do not retain a web-table lock while waiting for an external model. API
+    # schema checks must remain responsive during browser refresh.
+    conn.commit()
+    metrics = ExecutionMetrics(metrics_dsn,run_id,'web_worker','live' if live else 'disabled' if isinstance(model,DisabledModel) else 'simulated',submitted)
+    graph = build_agent(Timed(model,metrics,'model_adapter'), Timed(BusinessTools(conn),metrics,'tool'), saver,
+                        verifier=Timed(ReportVerifier(conn),metrics,'validation'))
     config = {"configurable": {"thread_id": str(run_id)}}
     try:
+        if live:
+            model.prepare(entrypoint='web_worker')
         existing = graph.get_state(config)
         if not existing.values:
             if command != "start":
@@ -43,11 +59,19 @@ def process_job(conn, saver, job, *, model=None):
         error = result.get("stop_reason") if status in ("failed", "partial") else None
         conn.execute("UPDATE investigation_web.jobs SET status=%s,error_code=%s,updated_at=now() WHERE job_id=%s", (status, error, job_id))
         conn.commit()
+        metrics.finish(status)
         return result
+    except ModelError as exc:
+        conn.rollback()
+        conn.execute("UPDATE investigation_web.jobs SET status='failed',error_code=%s,updated_at=now() WHERE job_id=%s", (exc.code,job_id))
+        conn.commit()
+        metrics.finish('failed')
+        return None
     except CheckpointCompatibilityError as exc:
         conn.rollback()
         conn.execute("UPDATE investigation_web.jobs SET status='failed',error_code=%s,updated_at=now() WHERE job_id=%s", (exc.code, job_id))
         conn.commit()
+        metrics.finish('failed')
         # Existing checkpoint and Case history stay untouched. Start a new run explicitly.
         return None
     except Exception:
@@ -55,18 +79,21 @@ def process_job(conn, saver, job, *, model=None):
         conn.rollback()
         conn.execute("UPDATE investigation_web.jobs SET status='interrupted',error_code='execution_interrupted',updated_at=now() WHERE job_id=%s", (job_id,))
         conn.commit()
+        metrics.finish('interrupted')
         raise
 
 
-def run_worker(dsn, *, once=False, model=None, live=False, phase="smoke"):
+def run_worker(dsn, *, once=False, model=None, live=False, phase="smoke", budget_database=None):
     with psycopg.connect(dsn, autocommit=True) as control:
         if not control.execute("SELECT pg_try_advisory_lock(%s)", (WORKER_LOCK,)).fetchone()[0]:
             raise ValueError("Another workbench worker is already running")
         try:
             Jobs(control).initialize()
             if live:
-                from enterpriseiq.budget import BudgetLedger
-                BudgetLedger(control).initialize()
+                from enterpriseiq.budget import BudgetLedger, budget_dsn
+                budget_database = budget_database or budget_dsn()
+                with psycopg.connect(budget_database) as budget_conn:
+                    BudgetLedger(budget_conn).initialize()
             Jobs(control).recover_interrupted()
             with postgres_checkpointer(dsn) as saver:
                 while True:
@@ -80,8 +107,8 @@ def run_worker(dsn, *, once=False, model=None, live=False, phase="smoke"):
                                 selected_model = model
                                 if live:
                                     from enterpriseiq.budget import BudgetedModel
-                                    selected_model = BudgetedModel(dsn, str(row[1]), phase=phase)
-                                process_job(conn, saver, row, model=selected_model)
+                                    selected_model = BudgetedModel(budget_database, str(row[1]), phase=phase)
+                                process_job(conn, saver, row, model=selected_model,metrics_database=dsn)
                             except Exception:
                                 print("Investigation interrupted; inspect its job and explicitly resume.", flush=True)
                     if once:
