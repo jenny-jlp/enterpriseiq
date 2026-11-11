@@ -1,9 +1,31 @@
 """Small DeepSeek Chat Completions adapter; no credentials or HTTP bodies in errors."""
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+import hashlib
+import json
 import os
 
 import httpx
+
+
+_budget_grant = ContextVar('budget_grant', default=None)
+
+
+def request_digest(messages, tools, model='deepseek-flash'):
+    return hashlib.sha256(json.dumps([model, messages, tools], ensure_ascii=False,
+                                    sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+@contextmanager
+def budget_grant(digest):
+    """One HTTP attempt per committed reservation; not an authentication boundary."""
+    token = _budget_grant.set(digest)
+    try:
+        yield
+    finally:
+        _budget_grant.reset(token)
 
 
 class ModelError(Exception):
@@ -32,6 +54,9 @@ class DeepSeekModel:
             raise ModelError("unsupported_deepseek_endpoint")
 
     def complete(self, messages: list[dict], tools: list[dict], timeout: float) -> Completion:
+        if _budget_grant.get() != request_digest(messages, tools, self.name):
+            raise ModelError('model_budget_context_required')
+        _budget_grant.set(None)
         try:
             # Non-thinking mode avoids storing or exporting hidden reasoning.
             with httpx.Client(timeout=httpx.Timeout(timeout), follow_redirects=False) as client:

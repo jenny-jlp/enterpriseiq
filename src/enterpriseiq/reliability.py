@@ -41,9 +41,9 @@ class CandidateClaim(ClosedModel):
 
 class ReferenceClaim(ClosedModel):
     kind: Literal["reference"]
-    evidence_id: str
-    field: str
-    target_evidence_id: str
+    evidence_id: str = Field(description="Observed source evidence_id. json_pointer identifies a structured record; start_line/end_line identify document text, not its metadata record.")
+    field: str | None = Field(default=None, description="For a structured record, an actual text field such as /description is required. For document lines, use null; metadata fields such as /content_file do not belong to a text excerpt.")
+    target_evidence_id: str = Field(description="Observed target evidence_id. The target source_id must occur literally in the cited source field or document lines; shared components and similar topics are not explicit references.")
 
 
 class ExposureClaim(ClosedModel):
@@ -117,7 +117,11 @@ Do NOT turn a generic transcript statement like 'I do not have an ETA' into an i
 Keep such general statements as kind=quote. Do not repeat an already supported issue ETA with weaker, unscoped evidence.
 arr claims MUST use the call_id from calculate_arr_exposure's result, exact account_ids and computed amount/currency.
 For a top-N question include exactly the requested highest N component arr claims, plus a global arr claim if asked; ties are ordered by PART-ID.
-candidate means shared component only; reference means a literal entity ID in the cited original field, never proof of causality.
+Evidence location is determined by the returned reference: json_pointer means a structured record; start_line/end_line mean document lines.
+The same source_id can have different evidence_ids for its metadata record and its document body. Never transfer fields between those evidence_ids.
+For kind=reference, use an actual text field for a record; use field=null for document lines, just as for a document quote.
+Do not invent /content_file, /body or /description on a document-lines evidence_id. Metadata paths do not prove a reference in the body.
+candidate means shared component only; reference requires the target source_id literally in THAT cited original field or those document lines, never proof of causality.
 Product area means a direct component. Geographic ARR aggregation is unsupported. Never invent arithmetic, exclusions or an aggregation dimension.
 open_questions are unverified questions, not conclusions. Tool completeness/errors will be checked independently; do not hide gaps.
 """
@@ -138,7 +142,19 @@ def repair_feedback(state, report):
         if item["code"] == "quote_not_in_original_source":
             details["explanation"] = "This exact quote is absent from the referenced evidence_id/field. Correct the source using actual tool results, or remove this unsupported optional claim. Do not repeat this unchanged claim."
         if isinstance(claim, dict):
-            details["referenced_source_id"] = state.get("evidence", {}).get(claim.get("evidence_id"), {}).get("source_id")
+            ref = state.get("evidence", {}).get(claim.get("evidence_id"), {})
+            details["referenced_source_id"] = ref.get("source_id")
+            details["evidence_kind"] = "record" if "json_pointer" in ref else "document_lines" if "start_line" in ref and "end_line" in ref else "unknown"
+            details["source_location"] = {k: ref[k] for k in ("source_path", "json_pointer", "start_line", "end_line") if k in ref}
+            if item["code"] == "document_has_no_record_field":
+                details["expected_field"] = None
+                details["explanation"] = "This evidence_id points to document lines, not a metadata record. Use field=null to cite those exact lines; a reference is valid only if the target source_id occurs literally there. Do not fabricate a record field or silently substitute metadata evidence."
+            if item["code"] == "explicit_reference_not_found":
+                details["explanation"] = "The target source_id is not a literal identifier in this exact cited field or line range. Similar subjects, shared components or a reference elsewhere do not support this assertion. Use a genuinely observed location containing that ID or omit this unsupported optional reference; never invent a link."
+            if item["code"] == "invalid_text_field" and details["evidence_kind"] == "record":
+                details["explanation"] = "This evidence_id points to a structured record. Supply an actual original text field; field=null does not mean its description or document body. Do not guess a field or switch locations implicitly."
+            if claim.get("kind") == "reference":
+                details["target_source_id"] = state.get("evidence", {}).get(claim.get("target_evidence_id"), {}).get("source_id")
         rejected.append(details)
     return {"gaps": report["gaps"], "rejected_assertions": rejected,
             "correction_rule": "Do not return any rejected assertion unchanged. Correct it using observed sources or omit an unsupported optional claim; preserve all required task outputs and all observed conflicts. Never fabricate a quote or evidence ID."}
@@ -398,7 +414,8 @@ class ReportVerifier:
             target, _ = self._resolve(claim.target_evidence_id)
             if not re.search(r"(?<![A-Za-z0-9-])"+re.escape(target["source_id"])+r"(?![A-Za-z0-9-])", text):
                 raise UnsupportedClaim("explicit_reference_not_found")
-            return f"{ref['source_id']}{claim.field} 原文明确提及 {target['source_id']}；不自动推断因果。"
+            location = claim.field if claim.field is not None else f" lines:{ref['start_line']}-{ref['end_line']}"
+            return f"{ref['source_id']}{location} 原文明确提及 {target['source_id']}；不自动推断因果。"
         ref, text = self._text(claim.evidence_id, claim.field)
         if claim.quote not in text:
             raise UnsupportedClaim("quote_not_in_original_source")
